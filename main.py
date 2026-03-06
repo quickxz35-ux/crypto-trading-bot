@@ -1,33 +1,45 @@
-import os
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from cachetools import TTLCache
 
 app = FastAPI()
 
-# -----------------------------
-# CACHE
-# -----------------------------
-
 cache = TTLCache(maxsize=200, ttl=60)
+
 
 # -----------------------------
 # SAFE REQUEST
 # -----------------------------
 
 def safe_get_json(url, params=None):
+
     try:
-        r = requests.get(url, params=params, timeout=15)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        r = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=15
+        )
+
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+
+        print("Request failed:", url, r.status_code)
+
+    except Exception as e:
+        print("Request error:", url, str(e))
+
     return None
 
 
 # -----------------------------
-# BINANCE SPOT DATA
+# BINANCE SYMBOLS
 # -----------------------------
 
 def get_binance_symbols():
@@ -41,6 +53,7 @@ def get_binance_symbols():
     symbols = []
 
     if isinstance(data, dict):
+
         for item in data.get("symbols", []):
 
             if (
@@ -50,22 +63,35 @@ def get_binance_symbols():
                 symbols.append(item.get("symbol"))
 
     cache["symbols"] = symbols
+
     return symbols
 
 
-def get_ticker_24h(symbol):
+# -----------------------------
+# BINANCE PRICE
+# -----------------------------
+
+def get_ticker(symbol):
 
     return safe_get_json(
         "https://api.binance.com/api/v3/ticker/24hr",
-        {"symbol": symbol},
+        {"symbol": symbol}
     )
 
 
-def get_klines(symbol, interval="1h", limit=2):
+# -----------------------------
+# BINANCE CANDLES
+# -----------------------------
+
+def get_klines(symbol):
 
     return safe_get_json(
         "https://api.binance.com/api/v3/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
+        {
+            "symbol": symbol,
+            "interval": "1h",
+            "limit": 2
+        }
     )
 
 
@@ -73,7 +99,7 @@ def get_klines(symbol, interval="1h", limit=2):
 # FUNDING PULSE
 # -----------------------------
 
-def get_funding_pulse():
+def get_funding():
 
     cached = cache.get("funding")
     if cached:
@@ -84,23 +110,25 @@ def get_funding_pulse():
     result = {}
 
     if isinstance(data, list):
+
         for item in data:
 
             symbol = item.get("symbol")
 
             if symbol:
+
                 result[symbol.upper()] = {
-                    "oi": item.get("openInterest"),
                     "ls": item.get("longShortRatio"),
-                    "funding": item.get("fundingRate"),
+                    "oi": item.get("openInterest")
                 }
 
     cache["funding"] = result
+
     return result
 
 
 # -----------------------------
-# SCORING
+# SCORE
 # -----------------------------
 
 def compute_score(price_change, volume_change, long_short):
@@ -125,7 +153,7 @@ def compute_score(price_change, volume_change, long_short):
 
 def build_row(symbol):
 
-    ticker = get_ticker_24h(symbol)
+    ticker = get_ticker(symbol)
 
     if not ticker:
         return None
@@ -142,9 +170,10 @@ def build_row(symbol):
         last_vol = float(klines[1][5])
 
         if prev_vol > 0:
+
             volume_change = ((last_vol - prev_vol) / prev_vol) * 100
 
-    funding = get_funding_pulse()
+    funding = get_funding()
 
     deriv = funding.get(symbol)
 
@@ -152,6 +181,7 @@ def build_row(symbol):
     oi = None
 
     if deriv:
+
         long_short = deriv.get("ls")
         oi = deriv.get("oi")
 
@@ -164,12 +194,12 @@ def build_row(symbol):
         "volume_change": volume_change,
         "long_short": long_short,
         "open_interest": oi,
-        "score": score,
+        "score": score
     }
 
 
 # -----------------------------
-# SCANNER
+# SCAN
 # -----------------------------
 
 def scan():
@@ -196,6 +226,7 @@ def scan():
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
+
 def dashboard():
 
     rows = scan()
@@ -219,6 +250,7 @@ def dashboard():
     <html>
     <head>
     <title>Crypto Scanner</title>
+
     <style>
 
     body {{
@@ -275,10 +307,11 @@ def dashboard():
 # -----------------------------
 
 @app.get("/debug")
+
 def debug():
 
     return {
         "symbols_loaded": len(get_binance_symbols()),
-        "funding_items": len(get_funding_pulse()),
-        "cache_items": len(cache),
+        "funding_items": len(get_funding()),
+        "cache_items": len(cache)
     }

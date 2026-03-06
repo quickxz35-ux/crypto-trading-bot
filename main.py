@@ -315,3 +315,4 @@ def debug():
         "funding_items": len(get_funding()),
         "cache_items": len(cache)
     }
+

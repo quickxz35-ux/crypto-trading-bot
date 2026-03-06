@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional, Union
 
 import requests
+from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -15,6 +16,10 @@ DERIV_TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
 latest_dashboard_rows = []
 favorites = []
 binance_futures_symbols = set()
+
+# Cache layers
+api_cache = TTLCache(maxsize=500, ttl=60)
+row_cache = TTLCache(maxsize=500, ttl=45)
 
 
 class CoinRow(BaseModel):
@@ -123,6 +128,34 @@ def normalize_timeframes(scan_tf: str, deriv_tf: str):
     return scan_tf, deriv_tf
 
 
+def make_cache_key(prefix, *parts):
+    clean_parts = [str(part).upper().strip() for part in parts]
+    return f"{prefix}::" + "::".join(clean_parts)
+
+
+def cache_get(key):
+    return api_cache.get(key)
+
+
+def cache_set(key, value):
+    api_cache[key] = value
+    return value
+
+
+def row_cache_get(key):
+    return row_cache.get(key)
+
+
+def row_cache_set(key, value):
+    row_cache[key] = value
+    return value
+
+
+def clear_all_caches():
+    api_cache.clear()
+    row_cache.clear()
+
+
 def get_binance_futures_symbols():
     data = safe_get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
     symbols = set()
@@ -137,6 +170,11 @@ def get_binance_futures_symbols():
 def get_altfins_signals(scan_tf="1h"):
     if not ALTFINS_KEY:
         return []
+
+    cache_key = make_cache_key("altfins_signals", scan_tf)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     tf_to_window = {
         "5m": "now-30m",
@@ -163,64 +201,113 @@ def get_altfins_signals(scan_tf="1h"):
     )
 
     if isinstance(data, dict):
-        return data.get("content", [])
+        return cache_set(cache_key, data.get("content", []))
+
     return []
 
 
 def get_spot_klines(symbol, interval="1h", limit=3):
-    return safe_get_json(
+    cache_key = make_cache_key("spot_klines", symbol, interval, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://api.binance.com/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_spot_24h(symbol):
-    return safe_get_json(
+    cache_key = make_cache_key("spot_24h", symbol)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://api.binance.com/api/v3/ticker/24hr",
         params={"symbol": symbol},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_futures_24h(symbol):
-    return safe_get_json(
+    cache_key = make_cache_key("futures_24h", symbol)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/fapi/v1/ticker/24hr",
         params={"symbol": symbol},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_open_interest(symbol):
-    return safe_get_json(
+    cache_key = make_cache_key("open_interest", symbol)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/fapi/v1/openInterest",
         params={"symbol": symbol},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_open_interest_hist(symbol, period="5m", limit=2):
-    return safe_get_json(
+    cache_key = make_cache_key("oi_hist", symbol, period, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/futures/data/openInterestHist",
         params={"symbol": symbol, "period": period, "limit": limit},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_long_short_ratio(symbol, period="5m", limit=2):
-    return safe_get_json(
+    cache_key = make_cache_key("long_short_ratio", symbol, period, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
         params={"symbol": symbol, "period": period, "limit": limit},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_top_trader_ratio(symbol, period="5m", limit=2):
-    return safe_get_json(
+    cache_key = make_cache_key("top_trader_ratio", symbol, period, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
         params={"symbol": symbol, "period": period, "limit": limit},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def get_taker_buy_sell(symbol, period="5m", limit=2):
-    return safe_get_json(
+    cache_key = make_cache_key("taker_buy_sell", symbol, period, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = safe_get_json(
         "https://fapi.binance.com/futures/data/takerlongshortRatio",
         params={"symbol": symbol, "period": period, "limit": limit},
     )
+    return cache_set(cache_key, data) if data is not None else None
 
 
 def compute_price_change_tf(klines):
@@ -413,6 +500,17 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
     base_symbol = item.get("symbol", "").upper().strip()
     pair = f"{base_symbol}USDT"
 
+    cache_key = make_cache_key(
+        "coin_row",
+        base_symbol,
+        scan_tf,
+        deriv_tf,
+        item.get("signalName", ""),
+    )
+    cached = row_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     if pair not in binance_futures_symbols:
         return None
 
@@ -438,7 +536,7 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
     scalp_score = compute_scalp_score(scan_price_change, scan_volume_change, alt_score)
     deriv = compute_derivatives_metrics(pair, deriv_tf)
 
-    return {
+    row = {
         "symbol": base_symbol,
         "pair": pair,
         "signal": item.get("signalName", "N/A"),
@@ -452,8 +550,15 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
         **deriv,
     }
 
+    return row_cache_set(cache_key, row)
+
 
 def select_rows(scan_tf="1h", deriv_tf="5m"):
+    cache_key = make_cache_key("select_rows", scan_tf, deriv_tf)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     signals = get_altfins_signals(scan_tf=scan_tf)
     rows = []
 
@@ -469,7 +574,7 @@ def select_rows(scan_tf="1h", deriv_tf="5m"):
             rows.append(row)
 
     rows.sort(key=lambda x: x["scalp_score"], reverse=True)
-    return rows[:10]
+    return cache_set(cache_key, rows[:10])
 
 
 def build_select(name, options, selected):
@@ -515,6 +620,7 @@ def add_favorite(symbol: str = Query(...)):
     symbol = symbol.upper().strip()
     if symbol and symbol not in favorites:
         favorites.append(symbol)
+        clear_all_caches()
     return RedirectResponse(url="/favorites?scan_tf=1h&deriv_tf=5m", status_code=302)
 
 
@@ -522,13 +628,14 @@ def add_favorite(symbol: str = Query(...)):
 def remove_favorite(
     symbol: str = Query(...),
     scan_tf: str = Query("1h"),
-    deriv_tf: str = Query("5m")
+    deriv_tf: str = Query("5m"),
 ):
     symbol = symbol.upper().strip()
     scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
 
     if symbol in favorites:
         favorites.remove(symbol)
+        clear_all_caches()
 
     return RedirectResponse(
         url=f"/favorites?scan_tf={scan_tf}&deriv_tf={deriv_tf}",
@@ -958,6 +1065,16 @@ def api_health():
     }
 
 
+@app.get("/api/cache/stats")
+def api_cache_stats():
+    return {
+        "api_cache_items": len(api_cache),
+        "row_cache_items": len(row_cache),
+        "favorites_count": len(favorites),
+        "futures_symbols_loaded": len(binance_futures_symbols),
+    }
+
+
 @app.get("/api/dashboard", response_model=DashboardResponse)
 def api_dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
     global latest_dashboard_rows
@@ -977,7 +1094,7 @@ def api_dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
 def api_analyze(
     symbol: str = Query(...),
     scan_tf: str = Query("1h"),
-    deriv_tf: str = Query("5m")
+    deriv_tf: str = Query("5m"),
 ):
     symbol = symbol.upper().strip()
     scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
@@ -1065,6 +1182,7 @@ def api_add_favorite(payload: FavoriteRequest):
 
     if symbol not in favorites:
         favorites.append(symbol)
+        clear_all_caches()
 
     return {
         "message": "Favorite added",
@@ -1079,6 +1197,7 @@ def api_delete_favorite(symbol: str):
 
     if symbol in favorites:
         favorites.remove(symbol)
+        clear_all_caches()
         return {
             "message": "Favorite removed",
             "symbol": symbol,

@@ -30,7 +30,7 @@ async def altfins_worker():
             if isinstance(data, list):
                 items = data
             elif isinstance(data, dict):
-                items = data.get("data") or data.get("signals") or data.get("results")
+                items = data.get("content") or data.get("data") or data.get("signals") or data.get("results")
 
             if not isinstance(items, list):
                 print("Unexpected JSON shape:", data)
@@ -52,3 +52,4 @@ async def start_worker():
 @app.get("/")
 def home():
     return {"status": "altFINS worker running"}
+

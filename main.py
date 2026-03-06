@@ -22,28 +22,30 @@ def score_signal(item):
     price_change = parse_number(item.get("priceChange"))
     market_cap = parse_number(item.get("marketCap"))
 
+    # Ignore weak setups
+    if price_change <= 0:
+        return -999
+
+    if market_cap < 25000000:
+        return -999
+
     if direction == "BULLISH":
         score += 50
-    elif direction == "BEARISH":
-        score -= 20
 
-    score += min(price_change * 5, 20)
+    score += min(price_change * 5, 25)
 
     if market_cap > 500000000:
         score += 20
     elif market_cap > 100000000:
+        score += 15
+    else:
         score += 10
-    elif market_cap > 10000000:
-        score += 5
 
     if "Bull Power" in signal_name:
         score += 15
+
     if "Oversold" in signal_name:
-        score += 10
-    if "Bear Power" in signal_name:
-        score -= 10
-    if "Overbought" in signal_name:
-        score -= 10
+        score += 12
 
     return score
 
@@ -64,39 +66,32 @@ async def altfins_worker():
             )
 
             print("Status:", r.status_code)
+
             data = r.json()
 
-            items = None
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = (
-                    data.get("content")
-                    or data.get("data")
-                    or data.get("signals")
-                    or data.get("results")
-                )
+            items = data.get("content", [])
 
-            if not isinstance(items, list):
-                print("Unexpected JSON shape:", data)
-            else:
-                scored = []
-                for item in items:
-                    item["score"] = score_signal(item)
+            scored = []
+
+            for item in items:
+                score = score_signal(item)
+                if score > 0:
+                    item["score"] = score
                     scored.append(item)
 
-                top_10 = sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
+            top_10 = sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
 
-                print("===== TOP 10 OPPORTUNITIES =====")
-                for i, item in enumerate(top_10, start=1):
-                    print(
-                        f"{i}. {item.get('symbol')} | "
-                        f"{item.get('direction')} | "
-                        f"{item.get('signalName')} | "
-                        f"Change: {item.get('priceChange')} | "
-                        f"MC: {item.get('marketCap')} | "
-                        f"Score: {item.get('score')}"
-                    )
+            print("===== TOP 10 TRADE OPPORTUNITIES =====")
+
+            for i, item in enumerate(top_10, start=1):
+                print(
+                    f"{i}. {item.get('symbol')} | "
+                    f"{item.get('direction')} | "
+                    f"{item.get('signalName')} | "
+                    f"Change: {item.get('priceChange')} | "
+                    f"MC: {item.get('marketCap')} | "
+                    f"Score: {item.get('score')}"
+                )
 
         except Exception as e:
             print("Error:", e)
@@ -111,4 +106,4 @@ async def start_worker():
 
 @app.get("/")
 def home():
-    return {"status": "top-10 altFINS scanner running"}
+    return {"status": "filtered top-10 altFINS scanner running"}

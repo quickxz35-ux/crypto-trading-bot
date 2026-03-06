@@ -77,7 +77,6 @@ def get_binance_futures_symbols():
 
 
 def get_altfins_signals(scan_tf="1h"):
-    # altFINS time window is mapped from selected scan timeframe
     tf_to_window = {
         "5m": "now-30m",
         "15m": "now-2h",
@@ -229,6 +228,29 @@ def compute_scalp_score(scan_price_change, scan_volume_change, alt_score):
     return round(score, 2)
 
 
+def compute_explosion_score(row):
+    volume = row["scan_volume_change"] if row["scan_volume_change"] is not None else 0
+    oi = row["oi_change_pct"] if row["oi_change_pct"] is not None else 0
+    buy_sell = row["buy_sell_ratio"] if row["buy_sell_ratio"] is not None else 1
+    price = row["scan_price_change"] if row["scan_price_change"] is not None else 0
+
+    score = (
+        volume * 0.5
+        + oi * 20
+        + (buy_sell - 1) * 50
+        + price * 10
+    )
+    return round(score, 2)
+
+
+def is_real_explosion(row):
+    volume = row["scan_volume_change"] if row["scan_volume_change"] is not None else 0
+    oi = row["oi_change_pct"] if row["oi_change_pct"] is not None else 0
+    buy_sell = row["buy_sell_ratio"] if row["buy_sell_ratio"] is not None else 1
+
+    return volume > 200 and oi > 1 and buy_sell > 1.05
+
+
 def compute_derivatives_metrics(symbol, deriv_tf):
     if symbol not in binance_futures_symbols:
         return {
@@ -334,8 +356,11 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
         return None
 
     alt_score = signal_score(item)
-    if alt_score is None:
+    if alt_score is None and item.get("signalName") != "Favorite":
         return None
+
+    if alt_score is None:
+        alt_score = 0
 
     klines = get_spot_klines(pair, interval=scan_tf, limit=3)
     spot24 = get_spot_24h(pair)
@@ -647,14 +672,16 @@ def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
         deriv_tf = "5m"
 
     rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
-    rows.sort(key=lambda x: (
-        x["scan_volume_change"] if x["scan_volume_change"] is not None else -9999
-    ), reverse=True)
+    rows.sort(key=lambda x: compute_explosion_score(x), reverse=True)
 
     rows_html = ""
     for i, row in enumerate(rows, start=1):
+        explosion = compute_explosion_score(row)
+        highlight = is_real_explosion(row)
+        row_style = ' style="background:#4c1d95;"' if highlight else ""
+
         rows_html += f"""
-        <tr>
+        <tr{row_style}>
             <td>{i}</td>
             <td>{row['symbol']}</td>
             <td>{row['last_price']}</td>
@@ -662,11 +689,14 @@ def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
             <td>{format_num(row['scan_volume_change'], 2, '%')}</td>
             <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
             <td>{format_num(row['buy_sell_ratio'], 3)}</td>
+            <td>{format_num(row['buy_sell_change_pct'], 2, '%')}</td>
             <td>{format_num(row['long_short_ratio'], 3)}</td>
+            <td>{format_num(row['long_short_change_pct'], 2, '%')}</td>
             <td>{format_num(row['top_trader_ratio'], 3)}</td>
-            <td>{format_num(row['scalp_score'], 2)}</td>
+            <td>{format_num(explosion, 2)}</td>
             <td>{row['entry_bias']}</td>
             <td><a href="/analyze?symbol={row['symbol']}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/favorite?symbol={row['symbol']}" style="color:#facc15;">⭐ Add</a></td>
         </tr>
         """
 
@@ -697,6 +727,11 @@ def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
             <button type="submit">Apply</button>
         </form>
 
+        <form method="get" action="/favorite" style="margin-bottom:16px;">
+            <input name="symbol" placeholder="Add coin manually (SOL, ETH, BTC)" style="padding:8px;">
+            <button type="submit">Add to Favorites</button>
+        </form>
+
         <table>
             <tr>
                 <th>Rank</th>
@@ -706,14 +741,21 @@ def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
                 <th>{scan_tf} Vol %</th>
                 <th>{deriv_tf} OI Δ %</th>
                 <th>{deriv_tf} Buy/Sell</th>
+                <th>{deriv_tf} Buy/Sell Δ %</th>
                 <th>{deriv_tf} L/S</th>
+                <th>{deriv_tf} L/S Δ %</th>
                 <th>{deriv_tf} Top Trader</th>
-                <th>Scalp Score</th>
+                <th>Explosion Score</th>
                 <th>Entry Bias</th>
                 <th>Analyze</th>
+                <th>Favorite</th>
             </tr>
-            {rows_html if rows_html else "<tr><td colspan='12'>No data yet.</td></tr>"}
+            {rows_html if rows_html else "<tr><td colspan='15'>No data yet.</td></tr>"}
         </table>
+
+        <p style="margin-top:20px;">
+            Highlighted rows = Volume &gt; 200%, OI &gt; 1%, Buy/Sell &gt; 1.05
+        </p>
     </body>
     </html>
     """
@@ -737,8 +779,8 @@ def analyze(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str 
     if alt_item is None:
         alt_item = {
             "symbol": symbol,
-            "signalName": "N/A",
-            "direction": "N/A",
+            "signalName": "Favorite",
+            "direction": "BULLISH",
             "marketCap": "N/A",
             "priceChange": "N/A",
         }

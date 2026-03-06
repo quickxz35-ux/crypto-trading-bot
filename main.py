@@ -2,10 +2,12 @@ import asyncio
 import os
 import requests
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
 ALTFINS_KEY = os.getenv("ALTFINS_API_KEY")
+latest_top_10 = []
 
 
 def parse_number(value):
@@ -22,7 +24,6 @@ def score_signal(item):
     price_change = parse_number(item.get("priceChange"))
     market_cap = parse_number(item.get("marketCap"))
 
-    # Ignore weak setups
     if price_change <= 0:
         return -999
 
@@ -51,6 +52,8 @@ def score_signal(item):
 
 
 async def altfins_worker():
+    global latest_top_10
+
     while True:
         print("Checking altFINS signals...")
 
@@ -68,7 +71,6 @@ async def altfins_worker():
             print("Status:", r.status_code)
 
             data = r.json()
-
             items = data.get("content", [])
 
             scored = []
@@ -76,14 +78,17 @@ async def altfins_worker():
             for item in items:
                 score = score_signal(item)
                 if score > 0:
-                    item["score"] = score
+                    item["score"] = round(score, 2)
                     scored.append(item)
 
-            top_10 = sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
+            latest_top_10 = sorted(
+                scored,
+                key=lambda x: x["score"],
+                reverse=True
+            )[:10]
 
             print("===== TOP 10 TRADE OPPORTUNITIES =====")
-
-            for i, item in enumerate(top_10, start=1):
+            for i, item in enumerate(latest_top_10, start=1):
                 print(
                     f"{i}. {item.get('symbol')} | "
                     f"{item.get('direction')} | "
@@ -106,4 +111,75 @@ async def start_worker():
 
 @app.get("/")
 def home():
-    return {"status": "filtered top-10 altFINS scanner running"}
+    return {"status": "dashboard running", "dashboard": "/dashboard"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    rows = ""
+
+    for i, item in enumerate(latest_top_10, start=1):
+        color = "#16a34a" if item.get("direction") == "BULLISH" else "#dc2626"
+        rows += f"""
+        <tr>
+            <td>{i}</td>
+            <td>{item.get('symbol')}</td>
+            <td style="color:{color};font-weight:bold;">{item.get('direction')}</td>
+            <td>{item.get('signalName')}</td>
+            <td>{item.get('priceChange')}</td>
+            <td>{item.get('marketCap')}</td>
+            <td>{item.get('score')}</td>
+        </tr>
+        """
+
+    return f"""
+    <html>
+    <head>
+        <title>Crypto Dashboard</title>
+        <meta http-equiv="refresh" content="30">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #0f172a;
+                color: white;
+                padding: 20px;
+            }}
+            h1 {{
+                color: #38bdf8;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: #1e293b;
+            }}
+            th, td {{
+                padding: 12px;
+                border: 1px solid #334155;
+                text-align: left;
+            }}
+            th {{
+                background: #334155;
+            }}
+            tr:hover {{
+                background: #273549;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>Top 10 Crypto Opportunities</h1>
+        <p>Auto-refreshes every 30 seconds</p>
+        <table>
+            <tr>
+                <th>Rank</th>
+                <th>Coin</th>
+                <th>Direction</th>
+                <th>Signal</th>
+                <th>Price Change</th>
+                <th>Market Cap</th>
+                <th>Score</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """

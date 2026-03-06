@@ -1,10 +1,11 @@
-import asyncio
 import os
-import requests
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from contextlib import asynccontextmanager
+from typing import List, Optional, Union
 
-app = FastAPI()
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 ALTFINS_KEY = os.getenv("ALTFINS_API_KEY")
 
@@ -14,6 +15,55 @@ DERIV_TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
 latest_dashboard_rows = []
 favorites = []
 binance_futures_symbols = set()
+
+
+class CoinRow(BaseModel):
+    symbol: str
+    pair: str
+    signal: str
+    direction: str
+    market_cap: Union[str, int, float]
+    alt_price_change: Union[str, int, float]
+    last_price: Union[str, int, float]
+    scan_price_change: Optional[float] = None
+    scan_volume_change: Optional[float] = None
+    scalp_score: Optional[float] = None
+    open_interest: Union[str, int, float]
+    oi_change_pct: Optional[float] = None
+    buy_sell_ratio: Optional[float] = None
+    buy_sell_change_pct: Optional[float] = None
+    long_short_ratio: Optional[float] = None
+    long_short_change_pct: Optional[float] = None
+    top_trader_ratio: Optional[float] = None
+    smart_money: str
+    entry_bias: str
+
+
+class DashboardResponse(BaseModel):
+    scan_tf: str
+    deriv_tf: str
+    count: int
+    rows: List[CoinRow]
+
+
+class AnalyzeResponse(BaseModel):
+    scan_tf: str
+    deriv_tf: str
+    row: CoinRow
+    entry_idea: str
+    invalidation: str
+
+
+class FavoriteRequest(BaseModel):
+    symbol: str
+
+
+class FavoritesResponse(BaseModel):
+    scan_tf: str
+    deriv_tf: str
+    count: int
+    rows: List[CoinRow]
+    unavailable: List[str]
 
 
 def parse_number(value):
@@ -30,9 +80,9 @@ def parse_number(value):
 
 def safe_get_json(url, params=None, headers=None, timeout=20):
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
+        response = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if response.status_code == 200:
+            return response.json()
     except Exception:
         pass
     return None
@@ -40,9 +90,9 @@ def safe_get_json(url, params=None, headers=None, timeout=20):
 
 def safe_post_json(url, json_body=None, headers=None, timeout=20):
     try:
-        r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
+        response = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+        if response.status_code == 200:
+            return response.json()
     except Exception:
         pass
     return None
@@ -65,6 +115,14 @@ def format_num(value, decimals=2, suffix=""):
         return "N/A"
 
 
+def normalize_timeframes(scan_tf: str, deriv_tf: str):
+    if scan_tf not in SCAN_TIMEFRAMES:
+        scan_tf = "1h"
+    if deriv_tf not in DERIV_TIMEFRAMES:
+        deriv_tf = "5m"
+    return scan_tf, deriv_tf
+
+
 def get_binance_futures_symbols():
     data = safe_get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
     symbols = set()
@@ -77,6 +135,9 @@ def get_binance_futures_symbols():
 
 
 def get_altfins_signals(scan_tf="1h"):
+    if not ALTFINS_KEY:
+        return []
+
     tf_to_window = {
         "5m": "now-30m",
         "15m": "now-2h",
@@ -95,10 +156,10 @@ def get_altfins_signals(scan_tf="1h"):
         "https://altfins.com/api/v2/public/signals-feed/search-requests",
         json_body={
             "timeRange": {"from": from_window, "to": "now"},
-            "direction": "BULLISH"
+            "direction": "BULLISH",
         },
         headers={"X-API-KEY": ALTFINS_KEY},
-        timeout=20
+        timeout=20,
     )
 
     if isinstance(data, dict):
@@ -109,56 +170,56 @@ def get_altfins_signals(scan_tf="1h"):
 def get_spot_klines(symbol, interval="1h", limit=3):
     return safe_get_json(
         "https://api.binance.com/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit}
+        params={"symbol": symbol, "interval": interval, "limit": limit},
     )
 
 
 def get_spot_24h(symbol):
     return safe_get_json(
         "https://api.binance.com/api/v3/ticker/24hr",
-        params={"symbol": symbol}
+        params={"symbol": symbol},
     )
 
 
 def get_futures_24h(symbol):
     return safe_get_json(
         "https://fapi.binance.com/fapi/v1/ticker/24hr",
-        params={"symbol": symbol}
+        params={"symbol": symbol},
     )
 
 
 def get_open_interest(symbol):
     return safe_get_json(
         "https://fapi.binance.com/fapi/v1/openInterest",
-        params={"symbol": symbol}
+        params={"symbol": symbol},
     )
 
 
 def get_open_interest_hist(symbol, period="5m", limit=2):
     return safe_get_json(
         "https://fapi.binance.com/futures/data/openInterestHist",
-        params={"symbol": symbol, "period": period, "limit": limit}
+        params={"symbol": symbol, "period": period, "limit": limit},
     )
 
 
 def get_long_short_ratio(symbol, period="5m", limit=2):
     return safe_get_json(
         "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-        params={"symbol": symbol, "period": period, "limit": limit}
+        params={"symbol": symbol, "period": period, "limit": limit},
     )
 
 
 def get_top_trader_ratio(symbol, period="5m", limit=2):
     return safe_get_json(
         "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
-        params={"symbol": symbol, "period": period, "limit": limit}
+        params={"symbol": symbol, "period": period, "limit": limit},
     )
 
 
 def get_taker_buy_sell(symbol, period="5m", limit=2):
     return safe_get_json(
         "https://fapi.binance.com/futures/data/takerlongshortRatio",
-        params={"symbol": symbol, "period": period, "limit": limit}
+        params={"symbol": symbol, "period": period, "limit": limit},
     )
 
 
@@ -349,7 +410,7 @@ def compute_derivatives_metrics(symbol, deriv_tf):
 
 
 def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
-    base_symbol = item.get("symbol", "").upper()
+    base_symbol = item.get("symbol", "").upper().strip()
     pair = f"{base_symbol}USDT"
 
     if pair not in binance_futures_symbols:
@@ -375,7 +436,6 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
     scan_price_change = compute_price_change_tf(klines)
     scan_volume_change = compute_volume_change_tf(klines)
     scalp_score = compute_scalp_score(scan_price_change, scan_volume_change, alt_score)
-
     deriv = compute_derivatives_metrics(pair, deriv_tf)
 
     return {
@@ -389,7 +449,7 @@ def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
         "scan_price_change": scan_price_change,
         "scan_volume_change": scan_volume_change,
         "scalp_score": scalp_score,
-        **deriv
+        **deriv,
     }
 
 
@@ -430,10 +490,19 @@ def nav(scan_tf, deriv_tf):
     """
 
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global binance_futures_symbols
     binance_futures_symbols = get_binance_futures_symbols()
+    yield
+
+
+app = FastAPI(
+    title="Crypto Opportunities API",
+    description="Dashboard + JSON API for altFINS/Binance market scanning",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
@@ -443,34 +512,44 @@ def home():
 
 @app.get("/favorite")
 def add_favorite(symbol: str = Query(...)):
-    symbol = symbol.upper()
-    if symbol not in favorites:
+    symbol = symbol.upper().strip()
+    if symbol and symbol not in favorites:
         favorites.append(symbol)
     return RedirectResponse(url="/favorites?scan_tf=1h&deriv_tf=5m", status_code=302)
 
 
 @app.get("/remove_favorite")
-def remove_favorite(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
-    symbol = symbol.upper()
+def remove_favorite(
+    symbol: str = Query(...),
+    scan_tf: str = Query("1h"),
+    deriv_tf: str = Query("5m")
+):
+    symbol = symbol.upper().strip()
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
+
     if symbol in favorites:
         favorites.remove(symbol)
-    return RedirectResponse(url=f"/favorites?scan_tf={scan_tf}&deriv_tf={deriv_tf}", status_code=302)
+
+    return RedirectResponse(
+        url=f"/favorites?scan_tf={scan_tf}&deriv_tf={deriv_tf}",
+        status_code=302,
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
     global latest_dashboard_rows
 
-    if scan_tf not in SCAN_TIMEFRAMES:
-        scan_tf = "1h"
-    if deriv_tf not in DERIV_TIMEFRAMES:
-        deriv_tf = "5m"
-
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
     latest_dashboard_rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
 
     rows_html = ""
     for i, row in enumerate(latest_dashboard_rows, start=1):
-        smart_color = "#16a34a" if row["smart_money"] == "Bullish" else "#f87171" if row["smart_money"] == "Bearish" else "#eab308"
+        smart_color = (
+            "#16a34a" if row["smart_money"] == "Bullish"
+            else "#f87171" if row["smart_money"] == "Bearish"
+            else "#eab308"
+        )
 
         rows_html += f"""
         <tr>
@@ -560,10 +639,7 @@ def dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
 
 @app.get("/favorites", response_class=HTMLResponse)
 def favorites_page(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
-    if scan_tf not in SCAN_TIMEFRAMES:
-        scan_tf = "1h"
-    if deriv_tf not in DERIV_TIMEFRAMES:
-        deriv_tf = "5m"
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
 
     rows_html = ""
     for i, symbol in enumerate(favorites, start=1):
@@ -574,7 +650,9 @@ def favorites_page(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
             "marketCap": "N/A",
             "priceChange": "N/A",
         }
+
         row = build_coin_row(fake_alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+
         if row is None:
             rows_html += f"""
             <tr>
@@ -586,7 +664,11 @@ def favorites_page(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
             """
             continue
 
-        smart_color = "#16a34a" if row["smart_money"] == "Bullish" else "#f87171" if row["smart_money"] == "Bearish" else "#eab308"
+        smart_color = (
+            "#16a34a" if row["smart_money"] == "Bullish"
+            else "#f87171" if row["smart_money"] == "Bearish"
+            else "#eab308"
+        )
 
         rows_html += f"""
         <tr>
@@ -666,10 +748,7 @@ def favorites_page(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
 
 @app.get("/volume-explosions", response_class=HTMLResponse)
 def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
-    if scan_tf not in SCAN_TIMEFRAMES:
-        scan_tf = "1h"
-    if deriv_tf not in DERIV_TIMEFRAMES:
-        deriv_tf = "5m"
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
 
     rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
     rows.sort(key=lambda x: compute_explosion_score(x), reverse=True)
@@ -763,11 +842,8 @@ def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
 
 @app.get("/analyze", response_class=HTMLResponse)
 def analyze(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
-    symbol = symbol.upper()
-    if scan_tf not in SCAN_TIMEFRAMES:
-        scan_tf = "1h"
-    if deriv_tf not in DERIV_TIMEFRAMES:
-        deriv_tf = "5m"
+    symbol = symbol.upper().strip()
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
 
     alt_signals = get_altfins_signals(scan_tf=scan_tf)
     alt_item = None
@@ -786,6 +862,7 @@ def analyze(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str 
         }
 
     row = build_coin_row(alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+
     if row is None:
         pair = f"{symbol}USDT"
         return f"""
@@ -869,3 +946,143 @@ def analyze(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str 
     </body>
     </html>
     """
+
+
+@app.get("/api/health")
+def api_health():
+    return {
+        "status": "ok",
+        "altfins_key_present": bool(ALTFINS_KEY),
+        "binance_futures_symbols_loaded": len(binance_futures_symbols),
+        "favorites_count": len(favorites),
+    }
+
+
+@app.get("/api/dashboard", response_model=DashboardResponse)
+def api_dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    global latest_dashboard_rows
+
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
+    latest_dashboard_rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
+
+    return {
+        "scan_tf": scan_tf,
+        "deriv_tf": deriv_tf,
+        "count": len(latest_dashboard_rows),
+        "rows": latest_dashboard_rows,
+    }
+
+
+@app.get("/api/analyze", response_model=AnalyzeResponse)
+def api_analyze(
+    symbol: str = Query(...),
+    scan_tf: str = Query("1h"),
+    deriv_tf: str = Query("5m")
+):
+    symbol = symbol.upper().strip()
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
+
+    alt_signals = get_altfins_signals(scan_tf=scan_tf)
+    alt_item = None
+    for item in alt_signals:
+        if item.get("symbol", "").upper() == symbol:
+            alt_item = item
+            break
+
+    if alt_item is None:
+        alt_item = {
+            "symbol": symbol,
+            "signalName": "Favorite",
+            "direction": "BULLISH",
+            "marketCap": "N/A",
+            "priceChange": "N/A",
+        }
+
+    row = build_coin_row(alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{symbol}USDT is not available on Binance Futures",
+        )
+
+    invalidation = f"Below recent {scan_tf} low"
+    entry_idea = "Wait for confirmation"
+
+    if row["entry_bias"] == "Breakout watch":
+        entry_idea = f"Break local {scan_tf} high with strong {deriv_tf} buy flow"
+        invalidation = "Lose breakout level / OI stalls"
+    elif row["entry_bias"] == "Pullback watch":
+        entry_idea = f"Watch pullback and reclaim with strong {deriv_tf} buy flow"
+        invalidation = "Break below pullback support"
+    elif row["entry_bias"] == "Avoid":
+        entry_idea = "Avoid long until flow improves"
+
+    return {
+        "scan_tf": scan_tf,
+        "deriv_tf": deriv_tf,
+        "row": row,
+        "entry_idea": entry_idea,
+        "invalidation": invalidation,
+    }
+
+
+@app.get("/api/favorites", response_model=FavoritesResponse)
+def api_favorites(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    scan_tf, deriv_tf = normalize_timeframes(scan_tf, deriv_tf)
+
+    rows = []
+    unavailable = []
+
+    for symbol in favorites:
+        fake_alt_item = {
+            "symbol": symbol,
+            "signalName": "Favorite",
+            "direction": "BULLISH",
+            "marketCap": "N/A",
+            "priceChange": "N/A",
+        }
+        row = build_coin_row(fake_alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+        if row is None:
+            unavailable.append(symbol)
+        else:
+            rows.append(row)
+
+    return {
+        "scan_tf": scan_tf,
+        "deriv_tf": deriv_tf,
+        "count": len(rows),
+        "rows": rows,
+        "unavailable": unavailable,
+    }
+
+
+@app.post("/api/favorites")
+def api_add_favorite(payload: FavoriteRequest):
+    symbol = payload.symbol.upper().strip()
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    if symbol not in favorites:
+        favorites.append(symbol)
+
+    return {
+        "message": "Favorite added",
+        "symbol": symbol,
+        "favorites": favorites,
+    }
+
+
+@app.delete("/api/favorites/{symbol}")
+def api_delete_favorite(symbol: str):
+    symbol = symbol.upper().strip()
+
+    if symbol in favorites:
+        favorites.remove(symbol)
+        return {
+            "message": "Favorite removed",
+            "symbol": symbol,
+            "favorites": favorites,
+        }
+
+    raise HTTPException(status_code=404, detail="Favorite not found")

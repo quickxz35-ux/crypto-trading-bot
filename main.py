@@ -14,13 +14,25 @@ async def altfins_worker():
         try:
             r = requests.get(
                 "https://api.altfins.com/v1/signals",
-                headers={"Authorization": f"Bearer {ALTFINS_KEY}"}
+                headers={"Authorization": f"Bearer {ALTFINS_KEY}"},
+                timeout=20
             )
+
+            print("Status:", r.status_code)
 
             data = r.json()
 
-            for coin in data[:5]:
-                print("Signal:", coin)
+            items = None
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("data") or data.get("signals") or data.get("results")
+
+            if not isinstance(items, list):
+                print("Unexpected JSON shape:", data)
+            else:
+                for item in items[:5]:
+                    print("Signal:", item)
 
         except Exception as e:
             print("Error:", e)

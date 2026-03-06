@@ -1,11 +1,12 @@
 import asyncio
-import requests
 import os
+import requests
 from fastapi import FastAPI
 
 app = FastAPI()
 
 ALTFINS_KEY = os.getenv("ALTFINS_API_KEY")
+
 
 async def altfins_worker():
     while True:
@@ -30,13 +31,24 @@ async def altfins_worker():
             if isinstance(data, list):
                 items = data
             elif isinstance(data, dict):
-                items = data.get("content") or data.get("data") or data.get("signals") or data.get("results")
+                items = (
+                    data.get("content")
+                    or data.get("data")
+                    or data.get("signals")
+                    or data.get("results")
+                )
 
             if not isinstance(items, list):
                 print("Unexpected JSON shape:", data)
             else:
                 for item in items[:5]:
-                    print("Signal:", item)
+                    print(
+                        item.get("timestamp"),
+                        item.get("direction"),
+                        item.get("symbol"),
+                        item.get("signalName"),
+                        item.get("priceChange"),
+                    )
 
         except Exception as e:
             print("Error:", e)
@@ -52,4 +64,3 @@ async def start_worker():
 @app.get("/")
 def home():
     return {"status": "altFINS worker running"}
-

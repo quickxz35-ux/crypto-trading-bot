@@ -8,10 +8,12 @@ app = FastAPI()
 
 ALTFINS_KEY = os.getenv("ALTFINS_API_KEY")
 
-latest_top_10 = []
-favorites = []
+SCAN_TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
+DERIV_TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
 
-TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
+latest_dashboard_rows = []
+favorites = []
+binance_futures_symbols = set()
 
 
 def parse_number(value):
@@ -50,54 +52,72 @@ def pct_change(current, previous):
     current = parse_number(current)
     previous = parse_number(previous)
     if previous <= 0:
-        return 0.0
+        return None
     return ((current - previous) / previous) * 100.0
 
 
-def score_signal(item):
-    score = 0
-
-    direction = item.get("direction", "")
-    signal_name = item.get("signalName", "")
-    price_change = parse_number(item.get("priceChange"))
-    market_cap = parse_number(item.get("marketCap"))
-
-    if direction != "BULLISH":
-        return -999
-    if price_change <= 0:
-        return -999
-    if market_cap < 25000000:
-        return -999
-
-    score += 50
-    score += min(price_change * 5, 25)
-
-    if market_cap > 500000000:
-        score += 20
-    elif market_cap > 100000000:
-        score += 15
-    else:
-        score += 10
-
-    if "Bull Power" in signal_name:
-        score += 15
-    if "Oversold" in signal_name:
-        score += 12
-
-    return score
+def format_num(value, decimals=2, suffix=""):
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.{decimals}f}{suffix}"
+    except Exception:
+        return "N/A"
 
 
-def get_binance_spot_24h(symbol):
-    return safe_get_json(
-        "https://api.binance.com/api/v3/ticker/24hr",
-        params={"symbol": symbol}
+def get_binance_futures_symbols():
+    data = safe_get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    symbols = set()
+    if isinstance(data, dict):
+        for item in data.get("symbols", []):
+            sym = item.get("symbol")
+            if sym and item.get("status") == "TRADING":
+                symbols.add(sym.upper())
+    return symbols
+
+
+def get_altfins_signals(scan_tf="1h"):
+    # altFINS time window is mapped from selected scan timeframe
+    tf_to_window = {
+        "5m": "now-30m",
+        "15m": "now-2h",
+        "30m": "now-4h",
+        "1h": "now-6h",
+        "2h": "now-12h",
+        "4h": "now-24h",
+        "6h": "now-24h",
+        "12h": "now-2d",
+        "1d": "now-3d",
+    }
+
+    from_window = tf_to_window.get(scan_tf, "now-6h")
+
+    data = safe_post_json(
+        "https://altfins.com/api/v2/public/signals-feed/search-requests",
+        json_body={
+            "timeRange": {"from": from_window, "to": "now"},
+            "direction": "BULLISH"
+        },
+        headers={"X-API-KEY": ALTFINS_KEY},
+        timeout=20
     )
 
+    if isinstance(data, dict):
+        return data.get("content", [])
+    return []
 
-def get_binance_spot_klines(symbol, interval="5m", limit=3):
+
+def get_spot_klines(symbol, interval="1h", limit=3):
     return safe_get_json(
         "https://api.binance.com/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit}
+    )
+
+
+def get_spot_24h(symbol):
+    return safe_get_json(
+        "https://api.binance.com/api/v3/ticker/24hr",
+        params={"symbol": symbol}
     )
 
 
@@ -136,274 +156,315 @@ def get_top_trader_ratio(symbol, period="5m", limit=2):
     )
 
 
-def get_taker_buy_sell_volume(symbol, period="5m", limit=2):
+def get_taker_buy_sell(symbol, period="5m", limit=2):
     return safe_get_json(
         "https://fapi.binance.com/futures/data/takerlongshortRatio",
         params={"symbol": symbol, "period": period, "limit": limit}
     )
 
 
-def get_altfins_signal_map():
-    data = safe_post_json(
-        "https://altfins.com/api/v2/public/signals-feed/search-requests",
-        json_body={
-            "timeRange": {"from": "now-2h", "to": "now"},
-            "direction": "BULLISH"
-        },
-        headers={"X-API-KEY": ALTFINS_KEY},
-        timeout=20
-    )
-
-    signal_map = {}
-    if isinstance(data, dict):
-        for item in data.get("content", []):
-            symbol = item.get("symbol")
-            if symbol and symbol not in signal_map:
-                signal_map[symbol.upper()] = item
-    return signal_map
-
-
-def compute_volume_change_percent(klines):
-    if not isinstance(klines, list) or len(klines) < 2:
-        return 0.0
-    prev_vol = parse_number(klines[-2][5])
-    last_vol = parse_number(klines[-1][5])
-    if prev_vol <= 0:
-        return 0.0
-    return ((last_vol - prev_vol) / prev_vol) * 100.0
-
-
 def compute_price_change_tf(klines):
     if not isinstance(klines, list) or len(klines) < 1:
-        return 0.0
+        return None
     open_price = parse_number(klines[-1][1])
     close_price = parse_number(klines[-1][4])
     if open_price <= 0:
-        return 0.0
+        return None
     return ((close_price - open_price) / open_price) * 100.0
 
 
-def compute_ratio_change(data, field):
-    if not isinstance(data, list) or len(data) < 2:
-        return 0.0
-    prev_val = parse_number(data[-2].get(field))
-    last_val = parse_number(data[-1].get(field))
-    return pct_change(last_val, prev_val)
+def compute_volume_change_tf(klines):
+    if not isinstance(klines, list) or len(klines) < 2:
+        return None
+    prev_vol = parse_number(klines[-2][5])
+    last_vol = parse_number(klines[-1][5])
+    if prev_vol <= 0:
+        return None
+    return ((last_vol - prev_vol) / prev_vol) * 100.0
 
 
-def get_coin_metrics(base_symbol, tf="5m"):
-    if tf not in TIMEFRAMES:
-        tf = "5m"
+def signal_score(item):
+    direction = item.get("direction", "")
+    signal_name = item.get("signalName", "")
+    price_change = parse_number(item.get("priceChange"))
+    market_cap = parse_number(item.get("marketCap"))
 
-    spot_symbol = f"{base_symbol.upper()}USDT"
+    if direction != "BULLISH":
+        return None
+    if price_change <= 0:
+        return None
+    if market_cap < 25_000_000:
+        return None
 
-    spot24 = get_binance_spot_24h(spot_symbol)
-    klines = get_binance_spot_klines(spot_symbol, interval=tf, limit=3)
+    score = 50
+    score += min(price_change * 5, 20)
 
-    futures24 = get_futures_24h(spot_symbol)
-    oi = get_open_interest(spot_symbol)
-    oi_hist = get_open_interest_hist(spot_symbol, period=tf, limit=2)
-    ls = get_long_short_ratio(spot_symbol, period=tf, limit=2)
-    top_ls = get_top_trader_ratio(spot_symbol, period=tf, limit=2)
-    taker = get_taker_buy_sell_volume(spot_symbol, period=tf, limit=2)
+    if market_cap > 500_000_000:
+        score += 15
+    elif market_cap > 100_000_000:
+        score += 10
+    else:
+        score += 5
 
-    last_price = "N/A"
-    price_change_24h = "N/A"
-    volume_24h = "N/A"
+    if "Bull Power" in signal_name:
+        score += 10
+    if "Oversold" in signal_name:
+        score += 10
 
-    if isinstance(spot24, dict) and spot24.get("lastPrice"):
-        last_price = spot24.get("lastPrice")
-        price_change_24h = spot24.get("priceChangePercent")
-        volume_24h = spot24.get("volume")
+    return round(score, 2)
 
-    if last_price == "N/A" and isinstance(futures24, dict):
-        last_price = futures24.get("lastPrice", "N/A")
-        price_change_24h = futures24.get("priceChangePercent", "N/A")
-        volume_24h = futures24.get("volume", "N/A")
 
-    price_change_tf = round(compute_price_change_tf(klines), 2)
-    volume_change_tf = round(compute_volume_change_percent(klines), 2)
+def compute_scalp_score(scan_price_change, scan_volume_change, alt_score):
+    score = 0.0
 
-    oi_value = "N/A"
+    if scan_price_change is not None and scan_price_change > 0:
+        score += min(scan_price_change * 18, 35)
+
+    if scan_volume_change is not None and scan_volume_change > 0:
+        score += min(scan_volume_change * 0.7, 35)
+
+    if alt_score is not None:
+        score += min(alt_score * 0.35, 30)
+
+    return round(score, 2)
+
+
+def compute_derivatives_metrics(symbol, deriv_tf):
+    if symbol not in binance_futures_symbols:
+        return {
+            "open_interest": "N/A",
+            "oi_change_pct": None,
+            "buy_sell_ratio": None,
+            "buy_sell_change_pct": None,
+            "long_short_ratio": None,
+            "long_short_change_pct": None,
+            "top_trader_ratio": None,
+            "smart_money": "N/A",
+            "entry_bias": "N/A",
+        }
+
+    oi = get_open_interest(symbol)
+    oi_hist = get_open_interest_hist(symbol, period=deriv_tf, limit=2)
+    taker = get_taker_buy_sell(symbol, period=deriv_tf, limit=2)
+    ls = get_long_short_ratio(symbol, period=deriv_tf, limit=2)
+    top = get_top_trader_ratio(symbol, period=deriv_tf, limit=2)
+
+    open_interest = "N/A"
     if isinstance(oi, dict):
-        oi_value = oi.get("openInterest", "N/A")
+        open_interest = oi.get("openInterest", "N/A")
 
-    oi_change_pct = 0.0
+    oi_change_pct = None
     if isinstance(oi_hist, list) and len(oi_hist) >= 2:
         prev_oi = parse_number(oi_hist[-2].get("sumOpenInterest"))
         last_oi = parse_number(oi_hist[-1].get("sumOpenInterest"))
-        oi_change_pct = round(pct_change(last_oi, prev_oi), 2)
+        oi_change_pct = pct_change(last_oi, prev_oi)
 
-    long_short_ratio = 0.0
-    long_short_change_pct = 0.0
-    if isinstance(ls, list) and len(ls) >= 1:
-        long_short_ratio = round(parse_number(ls[-1].get("longShortRatio")), 3)
-        long_short_change_pct = round(compute_ratio_change(ls, "longShortRatio"), 2)
-
-    top_trader_ratio = 0.0
-    if isinstance(top_ls, list) and len(top_ls) >= 1:
-        top_trader_ratio = round(parse_number(top_ls[-1].get("longShortRatio")), 3)
-
-    buy_sell_ratio = 0.0
-    buy_sell_change_pct = 0.0
+    buy_sell_ratio = None
+    buy_sell_change_pct = None
     if isinstance(taker, list) and len(taker) >= 1:
-        buy_sell_ratio = round(parse_number(taker[-1].get("buySellRatio")), 3)
-        buy_sell_change_pct = round(compute_ratio_change(taker, "buySellRatio"), 2)
+        buy_sell_ratio = parse_number(taker[-1].get("buySellRatio"))
+    if isinstance(taker, list) and len(taker) >= 2:
+        prev_val = parse_number(taker[-2].get("buySellRatio"))
+        last_val = parse_number(taker[-1].get("buySellRatio"))
+        buy_sell_change_pct = pct_change(last_val, prev_val)
 
-    volume_explosion_score = 0
-    if price_change_tf > 0:
-        volume_explosion_score += min(price_change_tf * 15, 25)
-    if volume_change_tf > 0:
-        volume_explosion_score += min(volume_change_tf * 0.6, 35)
-    if buy_sell_ratio > 1:
-        volume_explosion_score += min((buy_sell_ratio - 1) * 40, 20)
-    if oi_change_pct > 0:
-        volume_explosion_score += min(oi_change_pct * 0.8, 20)
+    long_short_ratio = None
+    long_short_change_pct = None
+    if isinstance(ls, list) and len(ls) >= 1:
+        long_short_ratio = parse_number(ls[-1].get("longShortRatio"))
+    if isinstance(ls, list) and len(ls) >= 2:
+        prev_val = parse_number(ls[-2].get("longShortRatio"))
+        last_val = parse_number(ls[-1].get("longShortRatio"))
+        long_short_change_pct = pct_change(last_val, prev_val)
 
-    volume_explosion_score = round(volume_explosion_score, 2)
+    top_trader_ratio = None
+    if isinstance(top, list) and len(top) >= 1:
+        top_trader_ratio = parse_number(top[-1].get("longShortRatio"))
 
-    smart_money_label = "Neutral"
-    if top_trader_ratio >= 1.2 and buy_sell_ratio >= 1.05 and oi_change_pct > 0:
-        smart_money_label = "Bullish"
-    elif top_trader_ratio <= 0.9 and buy_sell_ratio <= 0.95 and oi_change_pct < 0:
-        smart_money_label = "Bearish"
+    smart_money = "Neutral"
+    if (
+        top_trader_ratio is not None and top_trader_ratio >= 1.15 and
+        buy_sell_ratio is not None and buy_sell_ratio >= 1.05 and
+        oi_change_pct is not None and oi_change_pct > 0
+    ):
+        smart_money = "Bullish"
+    elif (
+        top_trader_ratio is not None and top_trader_ratio <= 0.90 and
+        buy_sell_ratio is not None and buy_sell_ratio <= 0.95 and
+        oi_change_pct is not None and oi_change_pct < 0
+    ):
+        smart_money = "Bearish"
 
     entry_bias = "Wait"
-    if price_change_tf > 0.25 and volume_change_tf > 15 and buy_sell_ratio > 1.05 and oi_change_pct > 0:
-        entry_bias = "Breakout watch"
-    elif volume_change_tf > 15 and buy_sell_ratio > 1.05 and oi_change_pct > 0:
+    if (
+        buy_sell_ratio is not None and buy_sell_ratio > 1.05 and
+        oi_change_pct is not None and oi_change_pct > 0
+    ):
         entry_bias = "Pullback watch"
+    if (
+        buy_sell_ratio is not None and buy_sell_ratio > 1.08 and
+        oi_change_pct is not None and oi_change_pct > 1.0 and
+        long_short_ratio is not None and long_short_ratio > 1.0
+    ):
+        entry_bias = "Breakout watch"
+    if (
+        buy_sell_ratio is not None and buy_sell_ratio < 0.95 and
+        oi_change_pct is not None and oi_change_pct < 0
+    ):
+        entry_bias = "Avoid"
 
     return {
-        "symbol": base_symbol.upper(),
-        "pair": spot_symbol,
-        "tf": tf,
-        "last_price": last_price,
-        "price_change_24h": price_change_24h,
-        "volume_24h": volume_24h,
-        "price_change_tf": price_change_tf,
-        "volume_change_tf": volume_change_tf,
-        "open_interest": oi_value,
+        "open_interest": open_interest,
         "oi_change_pct": oi_change_pct,
+        "buy_sell_ratio": buy_sell_ratio,
+        "buy_sell_change_pct": buy_sell_change_pct,
         "long_short_ratio": long_short_ratio,
         "long_short_change_pct": long_short_change_pct,
         "top_trader_ratio": top_trader_ratio,
-        "buy_sell_ratio": buy_sell_ratio,
-        "buy_sell_change_pct": buy_sell_change_pct,
-        "volume_explosion_score": volume_explosion_score,
-        "smart_money_label": smart_money_label,
+        "smart_money": smart_money,
         "entry_bias": entry_bias,
     }
 
 
-def tf_dropdown(selected_tf, path):
-    options = ""
-    for tf in TIMEFRAMES:
-        selected = "selected" if tf == selected_tf else ""
-        options += f'<option value="{tf}" {selected}>{tf}</option>'
+def build_coin_row(item, scan_tf="1h", deriv_tf="5m"):
+    base_symbol = item.get("symbol", "").upper()
+    pair = f"{base_symbol}USDT"
+
+    if pair not in binance_futures_symbols:
+        return None
+
+    alt_score = signal_score(item)
+    if alt_score is None:
+        return None
+
+    klines = get_spot_klines(pair, interval=scan_tf, limit=3)
+    spot24 = get_spot_24h(pair)
+    futures24 = get_futures_24h(pair)
+
+    last_price = "N/A"
+    if isinstance(spot24, dict) and spot24.get("lastPrice"):
+        last_price = spot24.get("lastPrice")
+    elif isinstance(futures24, dict) and futures24.get("lastPrice"):
+        last_price = futures24.get("lastPrice")
+
+    scan_price_change = compute_price_change_tf(klines)
+    scan_volume_change = compute_volume_change_tf(klines)
+    scalp_score = compute_scalp_score(scan_price_change, scan_volume_change, alt_score)
+
+    deriv = compute_derivatives_metrics(pair, deriv_tf)
+
+    return {
+        "symbol": base_symbol,
+        "pair": pair,
+        "signal": item.get("signalName", "N/A"),
+        "direction": item.get("direction", "N/A"),
+        "market_cap": item.get("marketCap", "N/A"),
+        "alt_price_change": item.get("priceChange", "N/A"),
+        "last_price": last_price,
+        "scan_price_change": scan_price_change,
+        "scan_volume_change": scan_volume_change,
+        "scalp_score": scalp_score,
+        **deriv
+    }
+
+
+def select_rows(scan_tf="1h", deriv_tf="5m"):
+    signals = get_altfins_signals(scan_tf=scan_tf)
+    rows = []
+
+    seen = set()
+    for item in signals:
+        sym = item.get("symbol", "").upper()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+
+        row = build_coin_row(item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+        if row is not None:
+            rows.append(row)
+
+    rows.sort(key=lambda x: x["scalp_score"], reverse=True)
+    return rows[:10]
+
+
+def build_select(name, options, selected):
+    html = ""
+    for opt in options:
+        sel = "selected" if opt == selected else ""
+        html += f'<option value="{opt}" {sel}>{opt}</option>'
+    return f'<select name="{name}" style="padding:8px;">{html}</select>'
+
+
+def nav(scan_tf, deriv_tf):
     return f"""
-    <form method="get" action="{path}" style="margin:10px 0 20px 0;">
-        <label style="margin-right:10px;">Timeframe:</label>
-        <select name="tf" style="padding:8px;">{options}</select>
-        <button type="submit" style="padding:8px 14px;">Apply</button>
-    </form>
+    <div class="nav">
+        <a href="/dashboard?scan_tf={scan_tf}&deriv_tf={deriv_tf}">📊 Dashboard</a>
+        <a href="/favorites?scan_tf={scan_tf}&deriv_tf={deriv_tf}">⭐ Favorites</a>
+        <a href="/volume-explosions?scan_tf={scan_tf}&deriv_tf={deriv_tf}">⚡ Volume Explosions</a>
+    </div>
     """
 
 
-async def altfins_worker():
-    global latest_top_10
-
-    while True:
-        try:
-            data = safe_post_json(
-                "https://altfins.com/api/v2/public/signals-feed/search-requests",
-                json_body={
-                    "timeRange": {"from": "now-2h", "to": "now"},
-                    "direction": "BULLISH"
-                },
-                headers={"X-API-KEY": ALTFINS_KEY},
-                timeout=20
-            )
-
-            items = []
-            if isinstance(data, dict):
-                items = data.get("content", [])
-
-            scored = []
-            for item in items:
-                score = score_signal(item)
-                if score > 0:
-                    item["score"] = round(score, 2)
-                    scored.append(item)
-
-            latest_top_10 = sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
-
-        except Exception as e:
-            print("Worker error:", e)
-
-        await asyncio.sleep(600)
-
-
 @app.on_event("startup")
-async def start_worker():
-    asyncio.create_task(altfins_worker())
+async def startup():
+    global binance_futures_symbols
+    binance_futures_symbols = get_binance_futures_symbols()
 
 
 @app.get("/")
 def home():
-    return RedirectResponse(url="/dashboard")
+    return RedirectResponse(url="/dashboard?scan_tf=1h&deriv_tf=5m")
 
 
 @app.get("/favorite")
-def add_favorite(
-    symbol: str = Query(...),
-    signal: str = Query(""),
-    change: str = Query(""),
-    market_cap: str = Query(""),
-    score: str = Query("")
-):
-    global favorites
-
-    exists = any(item["symbol"] == symbol.upper() for item in favorites)
-    if not exists:
-        favorites.append({
-            "symbol": symbol.upper(),
-            "signal": signal,
-            "priceChange": change,
-            "marketCap": market_cap,
-            "score": score
-        })
-
-    return RedirectResponse(url="/favorites", status_code=302)
+def add_favorite(symbol: str = Query(...)):
+    symbol = symbol.upper()
+    if symbol not in favorites:
+        favorites.append(symbol)
+    return RedirectResponse(url="/favorites?scan_tf=1h&deriv_tf=5m", status_code=302)
 
 
 @app.get("/remove_favorite")
-def remove_favorite(symbol: str = Query(...)):
-    global favorites
-    favorites = [item for item in favorites if item["symbol"] != symbol.upper()]
-    return RedirectResponse(url="/favorites", status_code=302)
+def remove_favorite(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    symbol = symbol.upper()
+    if symbol in favorites:
+        favorites.remove(symbol)
+    return RedirectResponse(url=f"/favorites?scan_tf={scan_tf}&deriv_tf={deriv_tf}", status_code=302)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    rows = ""
+def dashboard(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    global latest_dashboard_rows
 
-    for i, item in enumerate(latest_top_10, start=1):
-        symbol = item.get("symbol", "")
-        rows += f"""
+    if scan_tf not in SCAN_TIMEFRAMES:
+        scan_tf = "1h"
+    if deriv_tf not in DERIV_TIMEFRAMES:
+        deriv_tf = "5m"
+
+    latest_dashboard_rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
+
+    rows_html = ""
+    for i, row in enumerate(latest_dashboard_rows, start=1):
+        smart_color = "#16a34a" if row["smart_money"] == "Bullish" else "#f87171" if row["smart_money"] == "Bearish" else "#eab308"
+
+        rows_html += f"""
         <tr>
             <td>{i}</td>
-            <td>{symbol}</td>
-            <td style="color:#16a34a;font-weight:bold;">{item.get('direction')}</td>
-            <td>{item.get('signalName')}</td>
-            <td>{item.get('priceChange')}</td>
-            <td>{item.get('marketCap')}</td>
-            <td>{item.get('score')}</td>
-            <td><a href="/analyze?symbol={symbol}&tf=5m" style="color:#38bdf8;">Analyze</a></td>
-            <td>
-                <a href="/favorite?symbol={symbol}&signal={item.get('signalName')}&change={item.get('priceChange')}&market_cap={item.get('marketCap')}&score={item.get('score')}"
-                   style="color:#facc15;text-decoration:none;font-weight:bold;">⭐ Add</a>
-            </td>
+            <td>{row['symbol']}</td>
+            <td>{row['signal']}</td>
+            <td>{row['market_cap']}</td>
+            <td>{format_num(row['scan_price_change'], 2, '%')}</td>
+            <td>{format_num(row['scan_volume_change'], 2, '%')}</td>
+            <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['buy_sell_ratio'], 3)}</td>
+            <td>{format_num(row['buy_sell_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['long_short_ratio'], 3)}</td>
+            <td>{format_num(row['long_short_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['top_trader_ratio'], 3)}</td>
+            <td style="color:{smart_color};font-weight:bold;">{row['smart_money']}</td>
+            <td>{format_num(row['scalp_score'], 2)}</td>
+            <td><a href="/analyze?symbol={row['symbol']}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/favorite?symbol={row['symbol']}" style="color:#facc15;">⭐ Add</a></td>
         </tr>
         """
 
@@ -411,55 +472,61 @@ def dashboard():
     <html>
     <head>
         <title>Crypto Dashboard</title>
-        <meta http-equiv="refresh" content="30">
+        <meta http-equiv="refresh" content="60">
         <style>
             body {{ font-family: Arial, sans-serif; background: #0f172a; color: white; padding: 20px; }}
             h1 {{ color: #38bdf8; }}
             .nav a {{ margin-right: 20px; color: #38bdf8; text-decoration: none; font-weight: bold; }}
-            table {{ width: 100%; border-collapse: collapse; background: #1e293b; }}
-            th, td {{ padding: 12px; border: 1px solid #334155; text-align: left; }}
+            table {{ width: 100%; border-collapse: collapse; background: #1e293b; font-size: 14px; }}
+            th, td {{ padding: 10px; border: 1px solid #334155; text-align: left; }}
             th {{ background: #334155; }}
             tr:hover {{ background: #273549; }}
-            input {{ padding: 10px; width: 240px; }}
-            button {{ padding: 10px 16px; }}
+            .controls {{ margin: 16px 0; }}
+            button {{ padding: 8px 14px; }}
+            select, input {{ margin-right: 10px; }}
         </style>
     </head>
     <body>
         <h1>Top 10 Crypto Opportunities</h1>
-        <div class="nav">
-            <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites?tf=5m">⭐ Favorites</a>
-            <a href="/volume-explosions?tf=5m">⚡ Volume Explosions</a>
-        </div>
-        <form action="/analyze" method="get" style="margin:20px 0;">
-            <input name="symbol" placeholder="Enter coin, e.g. BTC or SOL" />
-            <select name="tf" style="padding:10px;">
-                <option value="5m">5m</option>
-                <option value="15m">15m</option>
-                <option value="30m">30m</option>
-                <option value="1h">1h</option>
-                <option value="2h">2h</option>
-                <option value="4h">4h</option>
-                <option value="6h">6h</option>
-                <option value="12h">12h</option>
-                <option value="1d">1d</option>
-            </select>
+        {nav(scan_tf, deriv_tf)}
+
+        <form class="controls" method="get" action="/dashboard">
+            <label>Scan TF:</label>
+            {build_select("scan_tf", SCAN_TIMEFRAMES, scan_tf)}
+            <label>Derivatives TF:</label>
+            {build_select("deriv_tf", DERIV_TIMEFRAMES, deriv_tf)}
+            <button type="submit">Apply</button>
+        </form>
+
+        <form method="get" action="/analyze" style="margin-bottom:16px;">
+            <input name="symbol" placeholder="Enter coin, e.g. BTC or SOL" style="padding:8px;">
+            <input type="hidden" name="scan_tf" value="{scan_tf}">
+            <input type="hidden" name="deriv_tf" value="{deriv_tf}">
             <button type="submit">Analyze</button>
         </form>
-        <p>Auto-refreshes every 30 seconds</p>
+
+        <p>Refreshes every 1 minute</p>
+
         <table>
             <tr>
                 <th>Rank</th>
                 <th>Coin</th>
-                <th>Direction</th>
                 <th>Signal</th>
-                <th>Price Change</th>
                 <th>Market Cap</th>
-                <th>Score</th>
+                <th>{scan_tf} Price %</th>
+                <th>{scan_tf} Vol %</th>
+                <th>{deriv_tf} OI Δ %</th>
+                <th>{deriv_tf} Buy/Sell</th>
+                <th>{deriv_tf} Buy/Sell Δ %</th>
+                <th>{deriv_tf} L/S</th>
+                <th>{deriv_tf} L/S Δ %</th>
+                <th>{deriv_tf} Top Trader</th>
+                <th>Smart Money</th>
+                <th>Scalp Score</th>
                 <th>Analyze</th>
                 <th>Favorite</th>
             </tr>
-            {rows}
+            {rows_html if rows_html else "<tr><td colspan='16'>No matching Binance Futures coins found.</td></tr>"}
         </table>
     </body>
     </html>
@@ -467,31 +534,53 @@ def dashboard():
 
 
 @app.get("/favorites", response_class=HTMLResponse)
-def favorites_page(tf: str = Query("5m")):
-    rows = ""
+def favorites_page(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    if scan_tf not in SCAN_TIMEFRAMES:
+        scan_tf = "1h"
+    if deriv_tf not in DERIV_TIMEFRAMES:
+        deriv_tf = "5m"
 
-    for i, item in enumerate(favorites, start=1):
-        m = get_coin_metrics(item.get("symbol"), tf=tf)
-        smart_color = "#16a34a" if m["smart_money_label"] == "Bullish" else "#f87171" if m["smart_money_label"] == "Bearish" else "#eab308"
+    rows_html = ""
+    for i, symbol in enumerate(favorites, start=1):
+        fake_alt_item = {
+            "symbol": symbol,
+            "signalName": "Favorite",
+            "direction": "BULLISH",
+            "marketCap": "N/A",
+            "priceChange": "N/A",
+        }
+        row = build_coin_row(fake_alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+        if row is None:
+            rows_html += f"""
+            <tr>
+                <td>{i}</td>
+                <td>{symbol}</td>
+                <td colspan="12">Not available on Binance Futures</td>
+                <td><a href="/remove_favorite?symbol={symbol}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#f87171;">Remove</a></td>
+            </tr>
+            """
+            continue
 
-        rows += f"""
+        smart_color = "#16a34a" if row["smart_money"] == "Bullish" else "#f87171" if row["smart_money"] == "Bearish" else "#eab308"
+
+        rows_html += f"""
         <tr>
             <td>{i}</td>
-            <td>{item.get('symbol')}</td>
-            <td>{m.get('last_price')}</td>
-            <td>{m.get('price_change_tf')}%</td>
-            <td>{m.get('volume_change_tf')}%</td>
-            <td>{m.get('oi_change_pct')}%</td>
-            <td>{m.get('buy_sell_ratio')}</td>
-            <td>{m.get('buy_sell_change_pct')}%</td>
-            <td>{m.get('long_short_ratio')}</td>
-            <td>{m.get('long_short_change_pct')}%</td>
-            <td>{m.get('top_trader_ratio')}</td>
-            <td style="color:{smart_color};font-weight:bold;">{m.get('smart_money_label')}</td>
-            <td>{m.get('entry_bias')}</td>
-            <td>{m.get('volume_explosion_score')}</td>
-            <td><a href="/analyze?symbol={item.get('symbol')}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
-            <td><a href="/remove_favorite?symbol={item.get('symbol')}" style="color:#f87171;">Remove</a></td>
+            <td>{row['symbol']}</td>
+            <td>{row['last_price']}</td>
+            <td>{format_num(row['scan_price_change'], 2, '%')}</td>
+            <td>{format_num(row['scan_volume_change'], 2, '%')}</td>
+            <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['buy_sell_ratio'], 3)}</td>
+            <td>{format_num(row['buy_sell_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['long_short_ratio'], 3)}</td>
+            <td>{format_num(row['long_short_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['top_trader_ratio'], 3)}</td>
+            <td style="color:{smart_color};font-weight:bold;">{row['smart_money']}</td>
+            <td>{row['entry_bias']}</td>
+            <td>{format_num(row['scalp_score'], 2)}</td>
+            <td><a href="/analyze?symbol={row['symbol']}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/remove_favorite?symbol={row['symbol']}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#f87171;">Remove</a></td>
         </tr>
         """
 
@@ -499,45 +588,51 @@ def favorites_page(tf: str = Query("5m")):
     <html>
     <head>
         <title>Favorites</title>
-        <meta http-equiv="refresh" content="30">
+        <meta http-equiv="refresh" content="60">
         <style>
             body {{ font-family: Arial, sans-serif; background: #0f172a; color: white; padding: 20px; }}
             h1 {{ color: #facc15; }}
             .nav a {{ margin-right: 20px; color: #38bdf8; text-decoration: none; font-weight: bold; }}
-            table {{ width: 100%; border-collapse: collapse; background: #1e293b; }}
-            th, td {{ padding: 12px; border: 1px solid #334155; text-align: left; }}
+            table {{ width: 100%; border-collapse: collapse; background: #1e293b; font-size: 14px; }}
+            th, td {{ padding: 10px; border: 1px solid #334155; text-align: left; }}
             th {{ background: #334155; }}
             tr:hover {{ background: #273549; }}
+            .controls {{ margin: 16px 0; }}
+            button {{ padding: 8px 14px; }}
         </style>
     </head>
     <body>
-        <h1>⭐ Favorite Coins</h1>
-        <div class="nav">
-            <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites?tf={tf}">⭐ Favorites</a>
-            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
-        </div>
-        {tf_dropdown(tf, "/favorites")}
+        <h1>⭐ Favorites</h1>
+        {nav(scan_tf, deriv_tf)}
+
+        <form class="controls" method="get" action="/favorites">
+            <label>Scan TF:</label>
+            {build_select("scan_tf", SCAN_TIMEFRAMES, scan_tf)}
+            <label>Derivatives TF:</label>
+            {build_select("deriv_tf", DERIV_TIMEFRAMES, deriv_tf)}
+            <button type="submit">Apply</button>
+        </form>
+
         <table>
             <tr>
                 <th>#</th>
                 <th>Coin</th>
                 <th>Price</th>
-                <th>{tf} %</th>
-                <th>{tf} Vol %</th>
-                <th>OI Δ %</th>
-                <th>Buy/Sell</th>
-                <th>Buy/Sell Δ %</th>
-                <th>L/S</th>
-                <th>L/S Δ %</th>
-                <th>Top Trader</th>
+                <th>{scan_tf} Price %</th>
+                <th>{scan_tf} Vol %</th>
+                <th>{deriv_tf} OI Δ %</th>
+                <th>{deriv_tf} Buy/Sell</th>
+                <th>{deriv_tf} Buy/Sell Δ %</th>
+                <th>{deriv_tf} L/S</th>
+                <th>{deriv_tf} L/S Δ %</th>
+                <th>{deriv_tf} Top Trader</th>
                 <th>Smart Money</th>
                 <th>Entry Bias</th>
-                <th>Explosion</th>
+                <th>Scalp Score</th>
                 <th>Analyze</th>
                 <th>Action</th>
             </tr>
-            {rows if rows else "<tr><td colspan='16'>No favorites yet.</td></tr>"}
+            {rows_html if rows_html else "<tr><td colspan='16'>No favorites yet.</td></tr>"}
         </table>
     </body>
     </html>
@@ -545,34 +640,33 @@ def favorites_page(tf: str = Query("5m")):
 
 
 @app.get("/volume-explosions", response_class=HTMLResponse)
-def volume_explosions(tf: str = Query("5m")):
-    rows = ""
+def volume_explosions(scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
+    if scan_tf not in SCAN_TIMEFRAMES:
+        scan_tf = "1h"
+    if deriv_tf not in DERIV_TIMEFRAMES:
+        deriv_tf = "5m"
 
-    ranked = []
-    for item in latest_top_10:
-        symbol = item.get("symbol")
-        m = get_coin_metrics(symbol, tf=tf)
-        ranked.append(m)
+    rows = select_rows(scan_tf=scan_tf, deriv_tf=deriv_tf)
+    rows.sort(key=lambda x: (
+        x["scan_volume_change"] if x["scan_volume_change"] is not None else -9999
+    ), reverse=True)
 
-    ranked = sorted(ranked, key=lambda x: x["volume_explosion_score"], reverse=True)
-
-    for i, m in enumerate(ranked, start=1):
-        rows += f"""
+    rows_html = ""
+    for i, row in enumerate(rows, start=1):
+        rows_html += f"""
         <tr>
             <td>{i}</td>
-            <td>{m.get('symbol')}</td>
-            <td>{m.get('last_price')}</td>
-            <td>{m.get('price_change_tf')}%</td>
-            <td>{m.get('volume_change_tf')}%</td>
-            <td>{m.get('oi_change_pct')}%</td>
-            <td>{m.get('buy_sell_ratio')}</td>
-            <td>{m.get('buy_sell_change_pct')}%</td>
-            <td>{m.get('long_short_ratio')}</td>
-            <td>{m.get('long_short_change_pct')}%</td>
-            <td>{m.get('top_trader_ratio')}</td>
-            <td>{m.get('volume_explosion_score')}</td>
-            <td>{m.get('entry_bias')}</td>
-            <td><a href="/analyze?symbol={m.get('symbol')}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
+            <td>{row['symbol']}</td>
+            <td>{row['last_price']}</td>
+            <td>{format_num(row['scan_price_change'], 2, '%')}</td>
+            <td>{format_num(row['scan_volume_change'], 2, '%')}</td>
+            <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
+            <td>{format_num(row['buy_sell_ratio'], 3)}</td>
+            <td>{format_num(row['long_short_ratio'], 3)}</td>
+            <td>{format_num(row['top_trader_ratio'], 3)}</td>
+            <td>{format_num(row['scalp_score'], 2)}</td>
+            <td>{row['entry_bias']}</td>
+            <td><a href="/analyze?symbol={row['symbol']}&scan_tf={scan_tf}&deriv_tf={deriv_tf}" style="color:#38bdf8;">Analyze</a></td>
         </tr>
         """
 
@@ -580,42 +674,45 @@ def volume_explosions(tf: str = Query("5m")):
     <html>
     <head>
         <title>Volume Explosions</title>
-        <meta http-equiv="refresh" content="30">
+        <meta http-equiv="refresh" content="60">
         <style>
             body {{ font-family: Arial, sans-serif; background: #0f172a; color: white; padding: 20px; }}
             h1 {{ color: #f97316; }}
             .nav a {{ margin-right: 20px; color: #38bdf8; text-decoration: none; font-weight: bold; }}
-            table {{ width: 100%; border-collapse: collapse; background: #1e293b; }}
-            th, td {{ padding: 12px; border: 1px solid #334155; text-align: left; }}
+            table {{ width: 100%; border-collapse: collapse; background: #1e293b; font-size: 14px; }}
+            th, td {{ padding: 10px; border: 1px solid #334155; text-align: left; }}
             th {{ background: #334155; }}
+            .controls {{ margin: 16px 0; }}
         </style>
     </head>
     <body>
-        <h1>⚡ Volume Explosion Scanner</h1>
-        <div class="nav">
-            <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites?tf={tf}">⭐ Favorites</a>
-            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
-        </div>
-        {tf_dropdown(tf, "/volume-explosions")}
+        <h1>⚡ Volume Explosions</h1>
+        {nav(scan_tf, deriv_tf)}
+
+        <form class="controls" method="get" action="/volume-explosions">
+            <label>Scan TF:</label>
+            {build_select("scan_tf", SCAN_TIMEFRAMES, scan_tf)}
+            <label>Derivatives TF:</label>
+            {build_select("deriv_tf", DERIV_TIMEFRAMES, deriv_tf)}
+            <button type="submit">Apply</button>
+        </form>
+
         <table>
             <tr>
                 <th>Rank</th>
                 <th>Coin</th>
                 <th>Price</th>
-                <th>{tf} %</th>
-                <th>{tf} Vol %</th>
-                <th>OI Δ %</th>
-                <th>Buy/Sell</th>
-                <th>Buy/Sell Δ %</th>
-                <th>L/S</th>
-                <th>L/S Δ %</th>
-                <th>Top Trader</th>
-                <th>Explosion</th>
+                <th>{scan_tf} Price %</th>
+                <th>{scan_tf} Vol %</th>
+                <th>{deriv_tf} OI Δ %</th>
+                <th>{deriv_tf} Buy/Sell</th>
+                <th>{deriv_tf} L/S</th>
+                <th>{deriv_tf} Top Trader</th>
+                <th>Scalp Score</th>
                 <th>Entry Bias</th>
                 <th>Analyze</th>
             </tr>
-            {rows if rows else "<tr><td colspan='14'>No data yet.</td></tr>"}
+            {rows_html if rows_html else "<tr><td colspan='12'>No data yet.</td></tr>"}
         </table>
     </body>
     </html>
@@ -623,26 +720,53 @@ def volume_explosions(tf: str = Query("5m")):
 
 
 @app.get("/analyze", response_class=HTMLResponse)
-def analyze(symbol: str = Query(...), tf: str = Query("5m")):
+def analyze(symbol: str = Query(...), scan_tf: str = Query("1h"), deriv_tf: str = Query("5m")):
     symbol = symbol.upper()
-    metrics = get_coin_metrics(symbol, tf=tf)
-    signal_map = get_altfins_signal_map()
-    alt_signal = signal_map.get(symbol, {})
+    if scan_tf not in SCAN_TIMEFRAMES:
+        scan_tf = "1h"
+    if deriv_tf not in DERIV_TIMEFRAMES:
+        deriv_tf = "5m"
 
-    signal_name = alt_signal.get("signalName", "N/A")
-    signal_direction = alt_signal.get("direction", "N/A")
-    signal_change = alt_signal.get("priceChange", "N/A")
-    signal_market_cap = alt_signal.get("marketCap", "N/A")
+    alt_signals = get_altfins_signals(scan_tf=scan_tf)
+    alt_item = None
+    for item in alt_signals:
+        if item.get("symbol", "").upper() == symbol:
+            alt_item = item
+            break
 
-    entry_zone = "Wait for confirmation"
-    invalidation = f"Below recent {tf} low"
+    if alt_item is None:
+        alt_item = {
+            "symbol": symbol,
+            "signalName": "N/A",
+            "direction": "N/A",
+            "marketCap": "N/A",
+            "priceChange": "N/A",
+        }
 
-    if metrics["entry_bias"] == "Breakout watch":
-        entry_zone = "Enter on break of local high with volume + OI confirmation"
-        invalidation = "Lose breakout level / weak taker flow"
-    elif metrics["entry_bias"] == "Pullback watch":
-        entry_zone = "Watch pullback into support / reclaim with positive flow"
+    row = build_coin_row(alt_item, scan_tf=scan_tf, deriv_tf=deriv_tf)
+    if row is None:
+        pair = f"{symbol}USDT"
+        return f"""
+        <html>
+        <body style="font-family:Arial;background:#0f172a;color:white;padding:20px;">
+            {nav(scan_tf, deriv_tf)}
+            <h1>{symbol} Analysis</h1>
+            <p>{pair} is not currently available on Binance Futures, so derivatives metrics are not available.</p>
+        </body>
+        </html>
+        """
+
+    invalidation = f"Below recent {scan_tf} low"
+    entry_idea = "Wait for confirmation"
+
+    if row["entry_bias"] == "Breakout watch":
+        entry_idea = f"Break local {scan_tf} high with strong {deriv_tf} buy flow"
+        invalidation = "Lose breakout level / OI stalls"
+    elif row["entry_bias"] == "Pullback watch":
+        entry_idea = f"Watch pullback and reclaim with strong {deriv_tf} buy flow"
         invalidation = "Break below pullback support"
+    elif row["entry_bias"] == "Avoid":
+        entry_idea = "Avoid long until flow improves"
 
     return f"""
     <html>
@@ -653,66 +777,53 @@ def analyze(symbol: str = Query(...), tf: str = Query("5m")):
             h1 {{ color: #38bdf8; }}
             .card {{ background:#1e293b; padding:20px; margin-bottom:20px; border:1px solid #334155; }}
             .nav a {{ margin-right: 20px; color: #38bdf8; text-decoration: none; font-weight: bold; }}
+            .controls {{ margin: 16px 0; }}
+            button {{ padding: 8px 14px; }}
         </style>
     </head>
     <body>
-        <div class="nav">
-            <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites?tf={tf}">⭐ Favorites</a>
-            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
-        </div>
+        {nav(scan_tf, deriv_tf)}
+        <h1>{symbol} Analysis</h1>
 
-        <h1>{symbol} Trade Analysis</h1>
-        {tf_dropdown(tf, "/analyze")}
-        <form method="get" action="/analyze" style="display:none;">
+        <form class="controls" method="get" action="/analyze">
             <input type="hidden" name="symbol" value="{symbol}">
+            <label>Scan TF:</label>
+            {build_select("scan_tf", SCAN_TIMEFRAMES, scan_tf)}
+            <label>Derivatives TF:</label>
+            {build_select("deriv_tf", DERIV_TIMEFRAMES, deriv_tf)}
+            <button type="submit">Apply</button>
         </form>
 
         <div class="card">
             <h2>Market</h2>
-            <p>Pair: {metrics.get('pair')}</p>
-            <p>Last Price: {metrics.get('last_price')}</p>
-            <p>24h Change: {metrics.get('price_change_24h')}%</p>
-            <p>24h Volume: {metrics.get('volume_24h')}</p>
-            <p>{tf} Price Change: {metrics.get('price_change_tf')}%</p>
-            <p>{tf} Volume Change: {metrics.get('volume_change_tf')}%</p>
+            <p>Pair: {row['pair']}</p>
+            <p>Last Price: {row['last_price']}</p>
+            <p>altFINS Signal: {row['signal']}</p>
+            <p>altFINS Price Change: {row['alt_price_change']}</p>
+            <p>Market Cap: {row['market_cap']}</p>
+            <p>{scan_tf} Price Change: {format_num(row['scan_price_change'], 2, '%')}</p>
+            <p>{scan_tf} Volume Change: {format_num(row['scan_volume_change'], 2, '%')}</p>
         </div>
 
         <div class="card">
-            <h2>Order Flow / Derivatives</h2>
-            <p>Open Interest: {metrics.get('open_interest')}</p>
-            <p>OI Change %: {metrics.get('oi_change_pct')}%</p>
-            <p>Buy/Sell Ratio: {metrics.get('buy_sell_ratio')}</p>
-            <p>Buy/Sell Change %: {metrics.get('buy_sell_change_pct')}%</p>
-            <p>Long/Short Ratio: {metrics.get('long_short_ratio')}</p>
-            <p>Long/Short Change %: {metrics.get('long_short_change_pct')}%</p>
-            <p>Top Trader Ratio: {metrics.get('top_trader_ratio')}</p>
-            <p>Smart Money: {metrics.get('smart_money_label')}</p>
-            <p>Volume Explosion Score: {metrics.get('volume_explosion_score')}</p>
+            <h2>Derivatives ({deriv_tf})</h2>
+            <p>Open Interest: {row['open_interest']}</p>
+            <p>OI Change %: {format_num(row['oi_change_pct'], 2, '%')}</p>
+            <p>Buy/Sell Ratio: {format_num(row['buy_sell_ratio'], 3)}</p>
+            <p>Buy/Sell Change %: {format_num(row['buy_sell_change_pct'], 2, '%')}</p>
+            <p>Long/Short Ratio: {format_num(row['long_short_ratio'], 3)}</p>
+            <p>Long/Short Change %: {format_num(row['long_short_change_pct'], 2, '%')}</p>
+            <p>Top Trader Ratio: {format_num(row['top_trader_ratio'], 3)}</p>
+            <p>Smart Money: {row['smart_money']}</p>
         </div>
 
         <div class="card">
-            <h2>altFINS Context</h2>
-            <p>Signal Direction: {signal_direction}</p>
-            <p>Signal Name: {signal_name}</p>
-            <p>Signal Price Change: {signal_change}</p>
-            <p>Market Cap: {signal_market_cap}</p>
-        </div>
-
-        <div class="card">
-            <h2>Entry Guidance</h2>
-            <p>Bias: {metrics.get('entry_bias')}</p>
-            <p>Entry Idea: {entry_zone}</p>
+            <h2>Trade Guidance</h2>
+            <p>Scalp Score ({scan_tf} only): {format_num(row['scalp_score'], 2)}</p>
+            <p>Entry Bias: {row['entry_bias']}</p>
+            <p>Entry Idea: {entry_idea}</p>
             <p>Invalidation: {invalidation}</p>
         </div>
     </body>
     </html>
-    """.replace(
-        '<select name="tf" style="padding:8px;">',
-        f'<form method="get" action="/analyze" style="margin:10px 0 20px 0;"><input type="hidden" name="symbol" value="{symbol}"><label style="margin-right:10px;">Timeframe:</label><select name="tf" style="padding:8px;">',
-        1
-    ).replace(
-        "</form>",
-        '<button type="submit" style="padding:8px 14px;">Apply</button></form>',
-        1
-    )
+    """

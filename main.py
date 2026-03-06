@@ -7,12 +7,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 app = FastAPI(title="Scalping Screener")
 
 TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m"]
-
 favorites = []
 
-market_cache = TTLCache(maxsize=10, ttl=900)     # 15 min
-scan_cache = TTLCache(maxsize=20, ttl=45)        # 45 sec
-detail_cache = TTLCache(maxsize=5000, ttl=60)    # 60 sec
+market_cache = TTLCache(maxsize=10, ttl=900)      # 15 min
+scan_cache = TTLCache(maxsize=20, ttl=45)         # 45 sec
+detail_cache = TTLCache(maxsize=10000, ttl=90)    # 90 sec
 
 
 # -------------------------------------------------
@@ -72,11 +71,244 @@ def format_num(value, decimals=2, suffix=""):
 
 def normalize_coin(symbol):
     s = symbol.upper().replace("-", "").replace("_", "")
+    s = s.replace("SWAP", "")
     for quote in ["USDT", "USDC", "USD"]:
         if s.endswith(quote):
             return s[: -len(quote)]
     return s
 
+
+def clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
+
+def build_select(name, selected):
+    html = ""
+    for tf in TIMEFRAME_OPTIONS:
+        sel = "selected" if tf == selected else ""
+        html += f'<option value="{tf}" {sel}>{tf}</option>'
+    return f'<select name="{name}" style="padding:8px 10px;border-radius:8px;background:#0f172a;color:#fff;border:1px solid #334155;">{html}</select>'
+
+
+def metric_label(value, decimals=2, suffix=""):
+    return f'<div class="mini-num">{format_num(value, decimals, suffix)}</div>'
+
+
+def centered_bar(value, max_abs=8, width=120, height=10, decimals=2, suffix=""):
+    if value is None:
+        return '<span class="muted">N/A</span>'
+    v = clamp(float(value), -max_abs, max_abs)
+    half = width / 2
+    fill = (abs(v) / max_abs) * half
+    color = "#22c55e" if v > 0 else "#ef4444" if v < 0 else "#64748b"
+    left = half if v >= 0 else half - fill
+    return f"""
+    <div class="metric-wrap" title="{format_num(value, decimals, suffix)}">
+        <div class="bar centered" style="width:{width}px;height:{height}px;">
+            <div class="bar-mid"></div>
+            <div class="bar-fill" style="left:{left}px;width:{fill}px;background:{color};"></div>
+        </div>
+        {metric_label(value, decimals, suffix)}
+    </div>
+    """
+
+
+def fill_bar(value, max_value=100, width=120, height=10, color="#38bdf8", decimals=2, suffix=""):
+    if value is None:
+        return '<span class="muted">N/A</span>'
+    v = clamp(float(value), 0, max_value)
+    fill = (v / max_value) * width
+    return f"""
+    <div class="metric-wrap" title="{format_num(value, decimals, suffix)}">
+        <div class="bar" style="width:{width}px;height:{height}px;">
+            <div class="bar-fill" style="left:0;width:{fill}px;background:{color};"></div>
+        </div>
+        {metric_label(value, decimals, suffix)}
+    </div>
+    """
+
+
+def ratio_bar(value, center=1.0, max_dev=0.75, width=120, height=10, decimals=3):
+    if value is None:
+        return '<span class="muted">N/A</span>'
+    v = float(value)
+    dev = clamp(v - center, -max_dev, max_dev)
+    half = width / 2
+    fill = (abs(dev) / max_dev) * half if max_dev > 0 else 0
+    color = "#22c55e" if dev > 0 else "#ef4444" if dev < 0 else "#64748b"
+    left = half if dev >= 0 else half - fill
+    return f"""
+    <div class="metric-wrap" title="{format_num(value, decimals)}">
+        <div class="bar centered" style="width:{width}px;height:{height}px;">
+            <div class="bar-mid"></div>
+            <div class="bar-fill" style="left:{left}px;width:{fill}px;background:{color};"></div>
+        </div>
+        {metric_label(value, decimals)}
+    </div>
+    """
+
+
+def score_bar(value, max_score=100, width=120, height=10):
+    if value is None:
+        return '<span class="muted">N/A</span>'
+    v = clamp(float(value), 0, max_score)
+    color = "#22c55e" if v >= 70 else "#eab308" if v >= 40 else "#f97316"
+    return fill_bar(v, max_value=max_score, width=width, height=height, color=color, decimals=1)
+
+
+def bias_badge(bias):
+    color = "#22c55e" if bias == "Bullish" else "#ef4444" if bias == "Bearish" else "#eab308"
+    return f'<span style="color:{color};font-weight:700;">{bias}</span>'
+
+
+def base_layout(title, body):
+    return f"""
+    <html>
+    <head>
+        <title>{title}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background:#0f172a;
+                color:white;
+                padding:20px;
+                margin:0;
+            }}
+            h1 {{
+                color:#38bdf8;
+                margin-bottom:12px;
+            }}
+            .nav {{
+                margin-bottom:20px;
+            }}
+            .nav a {{
+                margin-right:20px;
+                color:#38bdf8;
+                text-decoration:none;
+                font-weight:bold;
+            }}
+            table {{
+                width:100%;
+                border-collapse:collapse;
+                background:#1e293b;
+                font-size:14px;
+                border:1px solid #334155;
+            }}
+            th, td {{
+                padding:10px;
+                border:1px solid #334155;
+                text-align:left;
+                vertical-align:middle;
+            }}
+            th {{
+                background:#334155;
+                position:sticky;
+                top:0;
+            }}
+            tr:hover {{
+                background:#273549;
+            }}
+            .controls {{
+                margin:16px 0;
+            }}
+            button {{
+                padding:8px 14px;
+                border-radius:8px;
+                border:1px solid #475569;
+                background:#1e293b;
+                color:white;
+                cursor:pointer;
+            }}
+            input, select {{
+                margin-right:10px;
+            }}
+            .card {{
+                background:#1e293b;
+                padding:20px;
+                border:1px solid #334155;
+                margin:16px 0;
+                border-radius:12px;
+            }}
+            .muted {{
+                color:#94a3b8;
+            }}
+            .metric-wrap {{
+                display:flex;
+                flex-direction:column;
+                gap:4px;
+                min-width:124px;
+            }}
+            .mini-num {{
+                color:#94a3b8;
+                font-size:11px;
+                line-height:1;
+            }}
+            .bar {{
+                position:relative;
+                background:#0f172a;
+                border:1px solid #334155;
+                border-radius:999px;
+                overflow:hidden;
+            }}
+            .bar.centered {{
+                background:linear-gradient(to right, rgba(239,68,68,0.10) 0%, rgba(15,23,42,1) 50%, rgba(34,197,94,0.10) 100%);
+            }}
+            .bar-mid {{
+                position:absolute;
+                left:50%;
+                top:0;
+                width:1px;
+                height:100%;
+                background:#64748b;
+                z-index:2;
+            }}
+            .bar-fill {{
+                position:absolute;
+                top:0;
+                height:100%;
+                border-radius:999px;
+                z-index:1;
+            }}
+            .grid {{
+                display:grid;
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap:14px;
+            }}
+            .metric-card {{
+                background:#0f172a;
+                border:1px solid #334155;
+                border-radius:12px;
+                padding:14px;
+            }}
+            .metric-title {{
+                color:#cbd5e1;
+                font-size:13px;
+                margin-bottom:8px;
+                font-weight:700;
+            }}
+            .table-wrap {{
+                overflow-x:auto;
+                border-radius:12px;
+            }}
+            a {{
+                text-decoration:none;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="nav">
+            <a href="/dashboard">📊 Screener</a>
+            <a href="/favorites">⭐ Favorites</a>
+        </div>
+        {body}
+    </body>
+    </html>
+    """
+
+
+# -------------------------------------------------
+# TIMEFRAME HELPERS
+# -------------------------------------------------
 
 def timeframe_to_binance(tf):
     return tf
@@ -106,43 +338,26 @@ def timeframe_to_bybit(tf):
     return mapping[tf]
 
 
-def build_select(name, selected):
-    html = ""
-    for tf in TIMEFRAME_OPTIONS:
-        sel = "selected" if tf == selected else ""
-        html += f'<option value="{tf}" {sel}>{tf}</option>'
-    return f'<select name="{name}" style="padding:8px;">{html}</select>'
+def shortlist_atr_floor(tf):
+    return {
+        "5m": 0.10,
+        "15m": 0.20,
+        "30m": 0.28,
+        "1h": 0.40,
+        "4h": 0.80,
+        "1d": 1.50,
+    }.get(tf, 0.20)
 
 
-def base_layout(title, body):
-    return f"""
-    <html>
-    <head>
-        <title>{title}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background:#0f172a; color:white; padding:20px; }}
-            h1 {{ color:#38bdf8; }}
-            .nav a {{ margin-right:20px; color:#38bdf8; text-decoration:none; font-weight:bold; }}
-            table {{ width:100%; border-collapse:collapse; background:#1e293b; font-size:14px; }}
-            th, td {{ padding:10px; border:1px solid #334155; text-align:left; }}
-            th {{ background:#334155; }}
-            tr:hover {{ background:#273549; }}
-            .controls {{ margin:16px 0; }}
-            button {{ padding:8px 14px; }}
-            input, select {{ margin-right:10px; }}
-            .card {{ background:#1e293b; padding:20px; border:1px solid #334155; margin:16px 0; }}
-            .muted {{ color:#94a3b8; }}
-        </style>
-    </head>
-    <body>
-        <div class="nav">
-            <a href="/dashboard">📊 Screener</a>
-            <a href="/favorites">⭐ Favorites</a>
-        </div>
-        {body}
-    </body>
-    </html>
-    """
+def deep_thresholds(tf):
+    return {
+        "5m": {"min_score": 18, "move_cap": 2.5, "vol_cap": 120, "oi_cap": 8, "atr_cap": 2.0},
+        "15m": {"min_score": 20, "move_cap": 3.0, "vol_cap": 150, "oi_cap": 10, "atr_cap": 2.5},
+        "30m": {"min_score": 22, "move_cap": 3.5, "vol_cap": 180, "oi_cap": 12, "atr_cap": 3.0},
+        "1h": {"min_score": 24, "move_cap": 4.0, "vol_cap": 220, "oi_cap": 15, "atr_cap": 4.0},
+        "4h": {"min_score": 26, "move_cap": 6.0, "vol_cap": 260, "oi_cap": 18, "atr_cap": 6.0},
+        "1d": {"min_score": 30, "move_cap": 10.0, "vol_cap": 300, "oi_cap": 20, "atr_cap": 10.0},
+    }[tf]
 
 
 # -------------------------------------------------
@@ -263,7 +478,7 @@ def get_okx_tickers():
                 coin = normalize_coin(inst_id)
                 result[coin] = {
                     "symbol": inst_id,
-                    "price_change_pct": parse_float(item.get("last"), 0),  # placeholder, replaced by candles
+                    "price_change_pct": None,
                     "price": parse_float(item.get("last")),
                     "volume_24h": parse_float(item.get("volCcy24h")),
                 }
@@ -398,7 +613,10 @@ def get_bybit_long_short(symbol, tf):
     if isinstance(data, dict):
         items = ((data.get("result") or {}).get("list")) or []
         if items:
-            return parse_float(items[0].get("buyRatio"), None) / max(parse_float(items[0].get("sellRatio"), 1), 1e-9)
+            buy = parse_float(items[0].get("buyRatio"), None)
+            sell = parse_float(items[0].get("sellRatio"), None)
+            if buy is not None and sell not in (None, 0):
+                return buy / max(sell, 1e-9)
     return None
 
 
@@ -418,18 +636,16 @@ def get_bybit_candles(symbol, tf, limit=6):
 
 
 # -------------------------------------------------
-# MARKET UNIVERSE / SHORTLIST
+# MERGED UNIVERSE
 # -------------------------------------------------
 
 def get_merged_universe():
     universe = {}
-
     for source in [get_binance_markets(), get_okx_markets(), get_bybit_markets()]:
         for coin, item in source.items():
             if coin not in universe:
                 universe[coin] = {"coin": coin, "exchanges": {}}
             universe[coin]["exchanges"][item["exchange"]] = item["symbol"]
-
     return universe
 
 
@@ -446,7 +662,6 @@ def get_merged_tickers():
         prices = []
         vols = []
         price_changes = []
-
         exchanges = {}
 
         if coin in binance:
@@ -477,33 +692,129 @@ def get_merged_tickers():
     return merged
 
 
-def shortlist_candidates():
-    merged = get_merged_tickers()
-    rows = list(merged.values())
-
-    # fast filter
-    filtered = []
-    for row in rows:
-        if parse_float(row["volume_24h"]) < 5_000_000:
-            continue
-        if abs(parse_float(row["price_change_pct_24h"])) < 0.8:
-            continue
-        filtered.append(row)
-
-    # rank cheap shortlist first
-    filtered.sort(
-        key=lambda x: (
-            abs(parse_float(x["price_change_pct_24h"]))
-            + math.log10(max(parse_float(x["volume_24h"]), 1))
-        ),
-        reverse=True,
-    )
-
-    return filtered[:90]
+def get_primary_exchange_symbol(exchange_symbols):
+    if "Binance" in exchange_symbols:
+        return "Binance", exchange_symbols["Binance"]
+    if "Bybit" in exchange_symbols:
+        return "Bybit", exchange_symbols["Bybit"]
+    if "OKX" in exchange_symbols:
+        return "OKX", exchange_symbols["OKX"]
+    return None, None
 
 
 # -------------------------------------------------
-# PER-EXCHANGE DETAIL METRICS
+# SHORTLIST SCAN
+# -------------------------------------------------
+
+def compute_shortlist_probe(exchange, symbol, tf):
+    cache_key = f"probe::{exchange}::{symbol}::{tf}"
+    if cache_key in detail_cache:
+        return detail_cache[cache_key]
+
+    candles = []
+    if exchange == "Binance":
+        candles = get_binance_candles(symbol, tf, 6)
+        if len(candles) >= 6:
+            current_open = parse_float(candles[-1][1])
+            current_close = parse_float(candles[-1][4])
+            current_high = parse_float(candles[-1][2])
+            current_low = parse_float(candles[-1][3])
+            current_vol = parse_float(candles[-1][7])
+            prev_5 = [parse_float(c[7]) for c in candles[-6:-1]]
+        else:
+            current_open = current_close = current_high = current_low = current_vol = None
+            prev_5 = []
+
+    elif exchange == "Bybit":
+        candles = get_bybit_candles(symbol, tf, 6)
+        if len(candles) >= 6:
+            candles = list(reversed(candles))
+            current_open = parse_float(candles[-1][1])
+            current_high = parse_float(candles[-1][2])
+            current_low = parse_float(candles[-1][3])
+            current_close = parse_float(candles[-1][4])
+            current_vol = parse_float(candles[-1][6])
+            prev_5 = [parse_float(c[6]) for c in candles[-6:-1]]
+        else:
+            current_open = current_close = current_high = current_low = current_vol = None
+            prev_5 = []
+
+    else:
+        candles = get_okx_candles(symbol, tf, 6)
+        if len(candles) >= 6:
+            candles = list(reversed(candles))
+            current_open = parse_float(candles[-1][1])
+            current_high = parse_float(candles[-1][2])
+            current_low = parse_float(candles[-1][3])
+            current_close = parse_float(candles[-1][4])
+            current_vol = parse_float(candles[-1][7]) or parse_float(candles[-1][6]) or parse_float(candles[-1][5])
+            prev_5 = [(parse_float(c[7]) or parse_float(c[6]) or parse_float(c[5])) for c in candles[-6:-1]]
+        else:
+            current_open = current_close = current_high = current_low = current_vol = None
+            prev_5 = []
+
+    avg_5 = avg(prev_5)
+    price_move_pct = pct_change(current_close, current_open) if current_open else None
+    rel_vol = (current_vol / avg_5) if (current_vol and avg_5 and avg_5 > 0) else None
+    atr_pct = ((current_high - current_low) / current_low) * 100.0 if current_low and current_low > 0 else None
+
+    result = {
+        "price_move_pct": price_move_pct,
+        "rel_volume": rel_vol,
+        "atr_pct": atr_pct,
+    }
+    detail_cache[cache_key] = result
+    return result
+
+
+def shortlist_candidates(tf):
+    merged = get_merged_tickers()
+    universe = get_merged_universe()
+
+    candidates = []
+    for coin, row in merged.items():
+        if parse_float(row["volume_24h"]) < 1_500_000:
+            continue
+
+        exchange, symbol = get_primary_exchange_symbol(universe.get(coin, {}).get("exchanges", {}))
+        if not exchange or not symbol:
+            continue
+
+        probe = compute_shortlist_probe(exchange, symbol, tf)
+        move = probe["price_move_pct"]
+        rel_vol = probe["rel_volume"]
+        atr_pct = probe["atr_pct"]
+
+        if move is None or rel_vol is None or atr_pct is None:
+            continue
+
+        if atr_pct < shortlist_atr_floor(tf):
+            continue
+
+        score = (
+            min(abs(move), 6.0) * 0.50 +
+            min(rel_vol, 4.0) * 0.40 +
+            min(atr_pct, 6.0) * 0.10
+        )
+
+        candidates.append({
+            "coin": coin,
+            "exchanges": row["exchanges"],
+            "price": row["price"],
+            "volume_24h": row["volume_24h"],
+            "price_change_pct_24h": row["price_change_pct_24h"],
+            "shortlist_move_pct": move,
+            "shortlist_rel_volume": rel_vol,
+            "shortlist_atr_pct": atr_pct,
+            "shortlist_score": round(score, 4),
+        })
+
+    candidates.sort(key=lambda x: x["shortlist_score"], reverse=True)
+    return candidates[:90]
+
+
+# -------------------------------------------------
+# DEEP METRICS
 # -------------------------------------------------
 
 def compute_candle_metrics_binance(symbol, tf):
@@ -512,20 +823,20 @@ def compute_candle_metrics_binance(symbol, tf):
         return detail_cache[cache_key]
 
     candles = get_binance_candles(symbol, tf, 6)
-    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None}
+    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None, "rel_volume": None}
 
     if len(candles) >= 6:
-        # order oldest -> newest already
         current_open = parse_float(candles[-1][1])
         current_close = parse_float(candles[-1][4])
         current_high = parse_float(candles[-1][2])
         current_low = parse_float(candles[-1][3])
-        current_vol = parse_float(candles[-1][7])  # quote volume
+        current_vol = parse_float(candles[-1][7])
         prev_5 = [parse_float(c[7]) for c in candles[-6:-1]]
         avg_5 = avg(prev_5)
 
         result["price_change_pct"] = pct_change(current_close, current_open)
         result["volume_change_pct"] = pct_change(current_vol, avg_5)
+        result["rel_volume"] = (current_vol / avg_5) if avg_5 and avg_5 > 0 else None
         if current_low > 0:
             result["volatility_pct"] = ((current_high - current_low) / current_low) * 100.0
 
@@ -539,23 +850,21 @@ def compute_candle_metrics_okx(symbol, tf):
         return detail_cache[cache_key]
 
     candles = get_okx_candles(symbol, tf, 6)
-    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None}
+    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None, "rel_volume": None}
 
     if len(candles) >= 6:
-        # newest first
         candles = list(reversed(candles))
         current_open = parse_float(candles[-1][1])
         current_high = parse_float(candles[-1][2])
         current_low = parse_float(candles[-1][3])
         current_close = parse_float(candles[-1][4])
         current_vol = parse_float(candles[-1][7]) or parse_float(candles[-1][6]) or parse_float(candles[-1][5])
-        prev_5 = []
-        for c in candles[-6:-1]:
-            prev_5.append(parse_float(c[7]) or parse_float(c[6]) or parse_float(c[5]))
+        prev_5 = [(parse_float(c[7]) or parse_float(c[6]) or parse_float(c[5])) for c in candles[-6:-1]]
         avg_5 = avg(prev_5)
 
         result["price_change_pct"] = pct_change(current_close, current_open)
         result["volume_change_pct"] = pct_change(current_vol, avg_5)
+        result["rel_volume"] = (current_vol / avg_5) if avg_5 and avg_5 > 0 else None
         if current_low > 0:
             result["volatility_pct"] = ((current_high - current_low) / current_low) * 100.0
 
@@ -569,21 +878,21 @@ def compute_candle_metrics_bybit(symbol, tf):
         return detail_cache[cache_key]
 
     candles = get_bybit_candles(symbol, tf, 6)
-    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None}
+    result = {"price_change_pct": None, "volume_change_pct": None, "volatility_pct": None, "rel_volume": None}
 
     if len(candles) >= 6:
-        # newest first
         candles = list(reversed(candles))
         current_open = parse_float(candles[-1][1])
         current_high = parse_float(candles[-1][2])
         current_low = parse_float(candles[-1][3])
         current_close = parse_float(candles[-1][4])
-        current_vol = parse_float(candles[-1][6])  # turnover
+        current_vol = parse_float(candles[-1][6])
         prev_5 = [parse_float(c[6]) for c in candles[-6:-1]]
         avg_5 = avg(prev_5)
 
         result["price_change_pct"] = pct_change(current_close, current_open)
         result["volume_change_pct"] = pct_change(current_vol, avg_5)
+        result["rel_volume"] = (current_vol / avg_5) if avg_5 and avg_5 > 0 else None
         if current_low > 0:
             result["volatility_pct"] = ((current_high - current_low) / current_low) * 100.0
 
@@ -592,8 +901,6 @@ def compute_candle_metrics_bybit(symbol, tf):
 
 
 def get_okx_oi_change(symbol, tf):
-    # OKX public OI history isn't as convenient across these timeframes.
-    # For v1 we use current OI only, no pct change from OKX.
     oi = get_okx_open_interest(symbol)
     return None, oi
 
@@ -612,6 +919,7 @@ def get_binance_exchange_metrics(symbol, tf):
         "price_change_pct": candle["price_change_pct"],
         "volume_change_pct": candle["volume_change_pct"],
         "volatility_pct": candle["volatility_pct"],
+        "rel_volume": candle["rel_volume"],
         "oi_change_pct": oi_change_pct,
         "open_interest": oi,
         "funding_rate": funding,
@@ -630,6 +938,7 @@ def get_okx_exchange_metrics(symbol, tf):
         "price_change_pct": candle["price_change_pct"],
         "volume_change_pct": candle["volume_change_pct"],
         "volatility_pct": candle["volatility_pct"],
+        "rel_volume": candle["rel_volume"],
         "oi_change_pct": oi_change_pct,
         "open_interest": oi,
         "funding_rate": funding,
@@ -648,6 +957,7 @@ def get_bybit_exchange_metrics(symbol, tf):
         "price_change_pct": candle["price_change_pct"],
         "volume_change_pct": candle["volume_change_pct"],
         "volatility_pct": candle["volatility_pct"],
+        "rel_volume": candle["rel_volume"],
         "oi_change_pct": oi_change_pct,
         "open_interest": oi,
         "funding_rate": funding,
@@ -681,8 +991,9 @@ def merge_metrics(coin, exchange_symbols, tf):
     if not metrics:
         return None
 
-    price_change_pct = avg([m["price_change_pct"] for m in metrics])
-    volume_change_pct = avg([m["volume_change_pct"] for m in metrics])
+    price_change_pct = avg([m["price_change_pct"] for m in metrics if m["price_change_pct"] is not None])
+    volume_change_pct = avg([m["volume_change_pct"] for m in metrics if m["volume_change_pct"] is not None])
+    rel_volume = avg([m["rel_volume"] for m in metrics if m["rel_volume"] is not None])
     oi_change_pct = avg([m["oi_change_pct"] for m in metrics if m["oi_change_pct"] is not None])
     funding_rate = avg([m["funding_rate"] for m in metrics if m["funding_rate"] is not None])
     long_short_ratio = avg([m["long_short_ratio"] for m in metrics if m["long_short_ratio"] is not None])
@@ -708,24 +1019,12 @@ def merge_metrics(coin, exchange_symbols, tf):
     ):
         bias = "Bearish"
 
-    liquidation_boost = 0
-    if liquidation_total is not None:
-        liquidation_boost = min(liquidation_total / 1_000_000, 10)
-
-    activity_score = round(
-        (abs(price_change_pct) if price_change_pct is not None else 0) * 10
-        + (max(volume_change_pct, 0) if volume_change_pct is not None else 0) * 4
-        + (abs(oi_change_pct) if oi_change_pct is not None else 0) * 12
-        + (volatility_pct if volatility_pct is not None else 0) * 8
-        + liquidation_boost,
-        2,
-    )
-
     return {
         "coin": coin,
         "exchanges": ", ".join(contributing),
         "price_change_pct": price_change_pct,
         "volume_change_pct": volume_change_pct,
+        "rel_volume": rel_volume,
         "oi_change_pct": oi_change_pct,
         "long_short_ratio": long_short_ratio,
         "funding_rate": funding_rate,
@@ -733,8 +1032,40 @@ def merge_metrics(coin, exchange_symbols, tf):
         "liquidations": liquidation_total,
         "open_interest": open_interest,
         "bias": bias,
-        "activity_score": activity_score,
+        "activity_score": 0,
     }
+
+
+def score_deep_scan(row, tf):
+    t = deep_thresholds(tf)
+
+    move = min(abs(parse_float(row.get("price_change_pct"), 0)), t["move_cap"])
+    vol = min(max(parse_float(row.get("volume_change_pct"), 0), 0), t["vol_cap"])
+    oi = min(abs(parse_float(row.get("oi_change_pct"), 0)), t["oi_cap"])
+    atr = min(parse_float(row.get("volatility_pct"), 0), t["atr_cap"])
+    rel_vol = min(parse_float(row.get("rel_volume"), 0), 4.0)
+    funding = parse_float(row.get("funding_rate"), 0)
+    lsr = row.get("long_short_ratio")
+
+    score = 0.0
+    score += move * 7.0
+    score += vol * 0.16
+    score += oi * 3.0
+    score += atr * 5.0
+    score += rel_vol * 8.0
+
+    if row["bias"] == "Bullish":
+        score += 6
+    elif row["bias"] == "Bearish":
+        score += 6
+
+    if funding is not None and abs(funding) > 0.0001:
+        score += min(abs(funding) * 10000, 5)
+
+    if lsr is not None and abs(lsr - 1.0) > 0.05:
+        score += min(abs(lsr - 1.0) * 10, 5)
+
+    return round(min(score, 100), 2)
 
 
 # -------------------------------------------------
@@ -749,32 +1080,31 @@ def run_scan(tf):
     if tf not in TIMEFRAME_OPTIONS:
         return []
 
-    candidates = shortlist_candidates()
+    candidates = shortlist_candidates(tf)
 
-    # stage 2: OI + candles on shortlist
     rows = []
     for c in candidates:
         merged = merge_metrics(c["coin"], c["exchanges"], tf)
         if merged is None:
             continue
 
-        # shortlist rules with OI included
-        if merged["price_change_pct"] is None:
-            continue
-        if abs(merged["price_change_pct"]) < 0.5:
-            continue
-        if merged["volume_change_pct"] is not None and merged["volume_change_pct"] < 5:
-            continue
-        if merged["oi_change_pct"] is not None and abs(merged["oi_change_pct"]) < 0.3:
-            continue
+        merged["shortlist_score"] = c["shortlist_score"]
+        merged["shortlist_move_pct"] = c["shortlist_move_pct"]
+        merged["shortlist_rel_volume"] = c["shortlist_rel_volume"]
+        merged["shortlist_atr_pct"] = c["shortlist_atr_pct"]
+        merged["activity_score"] = score_deep_scan(merged, tf)
 
         rows.append(merged)
 
     rows.sort(key=lambda x: x["activity_score"], reverse=True)
-    rows = rows[:30]
 
-    scan_cache[cache_key] = rows
-    return rows
+    threshold = deep_thresholds(tf)["min_score"]
+    strict_rows = [r for r in rows if r["activity_score"] >= threshold]
+
+    final_rows = strict_rows[:30] if strict_rows else rows[:30]
+
+    scan_cache[cache_key] = final_rows
+    return final_rows
 
 
 def analyze_coin(coin, tf):
@@ -784,7 +1114,65 @@ def analyze_coin(coin, tf):
     if coin not in universe:
         return None
 
-    return merge_metrics(coin, universe[coin]["exchanges"], tf)
+    row = merge_metrics(coin, universe[coin]["exchanges"], tf)
+    if row is None:
+        return None
+
+    row["activity_score"] = score_deep_scan(row, tf)
+    return row
+
+
+# -------------------------------------------------
+# HTML RENDERERS
+# -------------------------------------------------
+
+def screener_row_html(i, row, tf):
+    return f"""
+    <tr>
+        <td>{i}</td>
+        <td><b>{row['coin']}</b></td>
+        <td>{row['exchanges']}</td>
+        <td>{centered_bar(row['price_change_pct'], max_abs=6, suffix='%')}</td>
+        <td>{fill_bar(max(parse_float(row['volume_change_pct'], 0), 0), max_value=200, color='#8b5cf6', suffix='%')}</td>
+        <td>{centered_bar(row['oi_change_pct'], max_abs=10, suffix='%')}</td>
+        <td>{ratio_bar(row['long_short_ratio'])}</td>
+        <td>{centered_bar((parse_float(row['funding_rate'], 0) * 100), max_abs=0.10, suffix='%')}</td>
+        <td>{fill_bar(row['volatility_pct'], max_value=8, color='#f97316', suffix='%')}</td>
+        <td>{bias_badge(row['bias'])}</td>
+        <td>{score_bar(row['activity_score'])}</td>
+        <td><a href="/analyze?coin={row['coin']}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
+        <td><a href="/favorite?coin={row['coin']}" style="color:#facc15;">⭐ Add</a></td>
+    </tr>
+    """
+
+
+def favorite_row_html(i, row, tf):
+    return f"""
+    <tr>
+        <td>{i}</td>
+        <td><b>{row['coin']}</b></td>
+        <td>{row['exchanges']}</td>
+        <td>{centered_bar(row['price_change_pct'], max_abs=6, suffix='%')}</td>
+        <td>{fill_bar(max(parse_float(row['volume_change_pct'], 0), 0), max_value=200, color='#8b5cf6', suffix='%')}</td>
+        <td>{centered_bar(row['oi_change_pct'], max_abs=10, suffix='%')}</td>
+        <td>{ratio_bar(row['long_short_ratio'])}</td>
+        <td>{centered_bar((parse_float(row['funding_rate'], 0) * 100), max_abs=0.10, suffix='%')}</td>
+        <td>{fill_bar(row['volatility_pct'], max_value=8, color='#f97316', suffix='%')}</td>
+        <td>{bias_badge(row['bias'])}</td>
+        <td>{score_bar(row['activity_score'])}</td>
+        <td><a href="/analyze?coin={row['coin']}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
+        <td><a href="/remove_favorite?coin={row['coin']}" style="color:#f87171;">Remove</a></td>
+    </tr>
+    """
+
+
+def analyze_metric_card(title, bar_html):
+    return f"""
+    <div class="metric-card">
+        <div class="metric-title">{title}</div>
+        {bar_html}
+    </div>
+    """
 
 
 # -------------------------------------------------
@@ -798,7 +1186,6 @@ def home():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(tf: str = Query(None)):
-    rows_html = ""
     body = f"""
         <h1>Scalping Screener</h1>
         <form class="controls" method="get" action="/dashboard">
@@ -812,57 +1199,39 @@ def dashboard(tf: str = Query(None)):
         body += """
         <div class="card">
             <p>Select a timeframe and click <b>Scan</b>.</p>
-            <p class="muted">The screener will not run until you choose a timeframe.</p>
+            <p class="muted">Shortlist scan runs first. Deep scan only checks the Top 30/Top 90 candidates.</p>
         </div>
         """
         return base_layout("Scalping Screener", body)
 
     rows = run_scan(tf)
-
-    for i, row in enumerate(rows, start=1):
-        bias_color = "#16a34a" if row["bias"] == "Bullish" else "#ef4444" if row["bias"] == "Bearish" else "#eab308"
-        rows_html += f"""
-        <tr>
-            <td>{i}</td>
-            <td>{row['coin']}</td>
-            <td>{row['exchanges']}</td>
-            <td>{format_num(row['price_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['volume_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['long_short_ratio'], 3)}</td>
-            <td>{format_num(row['funding_rate'], 4)}</td>
-            <td>{format_num(row['volatility_pct'], 2, '%')}</td>
-            <td>{format_num(row['liquidations'], 2)}</td>
-            <td style="color:{bias_color};font-weight:bold;">{row['bias']}</td>
-            <td>{format_num(row['activity_score'], 2)}</td>
-            <td><a href="/analyze?coin={row['coin']}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
-            <td><a href="/favorite?coin={row['coin']}" style="color:#facc15;">⭐ Add</a></td>
-        </tr>
-        """
+    rows_html = "".join([screener_row_html(i, row, tf) for i, row in enumerate(rows, start=1)])
 
     body += f"""
         <div class="card">
-            <p>Showing merged Binance + OKX + Bybit results for <b>{tf}</b>.</p>
+            <p>Showing merged Binance + OKX + Bybit futures results for <b>{tf}</b>.</p>
+            <p class="muted">Scanner uses loose shortlist ATR, then deep-scan scoring. If strict matches are empty, it falls back to top-scored results instead of showing nothing.</p>
         </div>
-        <table>
-            <tr>
-                <th>#</th>
-                <th>Coin</th>
-                <th>Exchanges</th>
-                <th>Price %</th>
-                <th>Volume %</th>
-                <th>OI %</th>
-                <th>L/S</th>
-                <th>Funding</th>
-                <th>Volatility</th>
-                <th>Liquidations</th>
-                <th>Bias</th>
-                <th>Score</th>
-                <th>Analyze</th>
-                <th>Favorite</th>
-            </tr>
-            {rows_html if rows_html else "<tr><td colspan='14'>No matching coins found for this timeframe.</td></tr>"}
-        </table>
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>#</th>
+                    <th>Coin</th>
+                    <th>Exchanges</th>
+                    <th>Price</th>
+                    <th>Volume</th>
+                    <th>OI</th>
+                    <th>L/S</th>
+                    <th>Funding</th>
+                    <th>Volatility</th>
+                    <th>Bias</th>
+                    <th>Score</th>
+                    <th>Analyze</th>
+                    <th>Favorite</th>
+                </tr>
+                {rows_html if rows_html else "<tr><td colspan='13'>No matching coins found for this timeframe.</td></tr>"}
+            </table>
+        </div>
     """
     return base_layout("Scalping Screener", body)
 
@@ -877,7 +1246,7 @@ def analyze(coin: str = Query("BTC"), tf: str = Query("15m")):
     body = f"""
         <h1>{coin.upper()} Analysis</h1>
         <form class="controls" method="get" action="/analyze">
-            <input name="coin" value="{coin.upper()}" style="padding:8px;" />
+            <input name="coin" value="{coin.upper()}" style="padding:8px 10px;border-radius:8px;background:#0f172a;color:#fff;border:1px solid #334155;" />
             <label>Timeframe:</label>
             {build_select("tf", tf)}
             <button type="submit">Analyze</button>
@@ -892,22 +1261,23 @@ def analyze(coin: str = Query("BTC"), tf: str = Query("15m")):
         """
         return base_layout("Analyze Coin", body)
 
-    bias_color = "#16a34a" if row["bias"] == "Bullish" else "#ef4444" if row["bias"] == "Bearish" else "#eab308"
-
     body += f"""
         <div class="card">
             <p><b>Coin:</b> {row['coin']}</p>
             <p><b>Exchanges:</b> {row['exchanges']}</p>
-            <p><b>Price Change %:</b> {format_num(row['price_change_pct'], 2, '%')}</p>
-            <p><b>Volume Change %:</b> {format_num(row['volume_change_pct'], 2, '%')}</p>
-            <p><b>Open Interest Change %:</b> {format_num(row['oi_change_pct'], 2, '%')}</p>
-            <p><b>Long / Short Ratio:</b> {format_num(row['long_short_ratio'], 3)}</p>
-            <p><b>Funding Rate:</b> {format_num(row['funding_rate'], 4)}</p>
-            <p><b>Volatility:</b> {format_num(row['volatility_pct'], 2, '%')}</p>
-            <p><b>Liquidations:</b> {format_num(row['liquidations'], 2)}</p>
-            <p><b>Bias:</b> <span style="color:{bias_color};font-weight:bold;">{row['bias']}</span></p>
-            <p><b>Activity Score:</b> {format_num(row['activity_score'], 2)}</p>
+            <p><b>Bias:</b> {bias_badge(row['bias'])}</p>
         </div>
+
+        <div class="grid">
+            {analyze_metric_card("Price Momentum", centered_bar(row['price_change_pct'], max_abs=6, width=180, height=12, suffix='%'))}
+            {analyze_metric_card("Volume Activity", fill_bar(max(parse_float(row['volume_change_pct'], 0), 0), max_value=200, width=180, height=12, color='#8b5cf6', suffix='%'))}
+            {analyze_metric_card("Open Interest Flow", centered_bar(row['oi_change_pct'], max_abs=10, width=180, height=12, suffix='%'))}
+            {analyze_metric_card("Long / Short Positioning", ratio_bar(row['long_short_ratio'], width=180, height=12))}
+            {analyze_metric_card("Funding Pressure", centered_bar((parse_float(row['funding_rate'], 0) * 100), max_abs=0.10, width=180, height=12, suffix='%'))}
+            {analyze_metric_card("Volatility", fill_bar(row['volatility_pct'], max_value=8, width=180, height=12, color='#f97316', suffix='%'))}
+            {analyze_metric_card("Signal Strength", score_bar(row['activity_score'], max_score=100, width=180, height=12))}
+        </div>
+
         <div class="card">
             <a href="/favorite?coin={row['coin']}" style="color:#facc15;">⭐ Add to Favorites</a>
         </div>
@@ -928,31 +1298,13 @@ def favorites_page(tf: str = Query("15m")):
             <tr>
                 <td>{i}</td>
                 <td>{coin}</td>
-                <td colspan="9">Not found in current merged futures universe</td>
+                <td colspan="10">Not found in current merged futures universe</td>
                 <td><a href="/remove_favorite?coin={coin}" style="color:#f87171;">Remove</a></td>
             </tr>
             """
             continue
 
-        bias_color = "#16a34a" if row["bias"] == "Bullish" else "#ef4444" if row["bias"] == "Bearish" else "#eab308"
-
-        rows_html += f"""
-        <tr>
-            <td>{i}</td>
-            <td>{row['coin']}</td>
-            <td>{row['exchanges']}</td>
-            <td>{format_num(row['price_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['volume_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['oi_change_pct'], 2, '%')}</td>
-            <td>{format_num(row['long_short_ratio'], 3)}</td>
-            <td>{format_num(row['funding_rate'], 4)}</td>
-            <td>{format_num(row['volatility_pct'], 2, '%')}</td>
-            <td style="color:{bias_color};font-weight:bold;">{row['bias']}</td>
-            <td>{format_num(row['activity_score'], 2)}</td>
-            <td><a href="/analyze?coin={row['coin']}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
-            <td><a href="/remove_favorite?coin={row['coin']}" style="color:#f87171;">Remove</a></td>
-        </tr>
-        """
+        rows_html += favorite_row_html(i, row, tf)
 
     body = f"""
         <h1>Favorites</h1>
@@ -963,28 +1315,30 @@ def favorites_page(tf: str = Query("15m")):
         </form>
 
         <form class="controls" method="get" action="/favorite">
-            <input name="coin" placeholder="BTC, ETH, SOL" style="padding:8px;" />
+            <input name="coin" placeholder="BTC, ETH, SOL" style="padding:8px 10px;border-radius:8px;background:#0f172a;color:#fff;border:1px solid #334155;" />
             <button type="submit">Add Coin</button>
         </form>
 
-        <table>
-            <tr>
-                <th>#</th>
-                <th>Coin</th>
-                <th>Exchanges</th>
-                <th>Price %</th>
-                <th>Volume %</th>
-                <th>OI %</th>
-                <th>L/S</th>
-                <th>Funding</th>
-                <th>Volatility</th>
-                <th>Bias</th>
-                <th>Score</th>
-                <th>Analyze</th>
-                <th>Action</th>
-            </tr>
-            {rows_html if rows_html else "<tr><td colspan='13'>No favorites yet.</td></tr>"}
-        </table>
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>#</th>
+                    <th>Coin</th>
+                    <th>Exchanges</th>
+                    <th>Price</th>
+                    <th>Volume</th>
+                    <th>OI</th>
+                    <th>L/S</th>
+                    <th>Funding</th>
+                    <th>Volatility</th>
+                    <th>Bias</th>
+                    <th>Score</th>
+                    <th>Analyze</th>
+                    <th>Action</th>
+                </tr>
+                {rows_html if rows_html else "<tr><td colspan='13'>No favorites yet.</td></tr>"}
+            </table>
+        </div>
     """
     return base_layout("Favorites", body)
 
@@ -1006,8 +1360,11 @@ def remove_favorite(coin: str = Query(...)):
 
 
 @app.get("/debug")
-def debug():
+def debug(tf: str = Query("15m")):
     universe = get_merged_universe()
+    shortlist = shortlist_candidates(tf) if tf in TIMEFRAME_OPTIONS else []
+    scan = run_scan(tf) if tf in TIMEFRAME_OPTIONS else []
+
     return {
         "timeframes": TIMEFRAME_OPTIONS,
         "favorites_count": len(favorites),
@@ -1015,4 +1372,8 @@ def debug():
         "binance_markets": len(get_binance_markets()),
         "okx_markets": len(get_okx_markets()),
         "bybit_markets": len(get_bybit_markets()),
+        "shortlist_count": len(shortlist),
+        "scan_count": len(scan),
+        "sample_shortlist": shortlist[:5],
+        "sample_scan": scan[:5],
     }

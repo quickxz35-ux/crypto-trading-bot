@@ -12,15 +12,15 @@ async def altfins_worker():
         print("Checking altFINS signals...")
 
         try:
-           r = requests.post(
-    "https://altfins.com/api/v2/public/signals-feed/search-requests",
-    headers={"X-API-KEY": ALTFINS_KEY},
-    json={
-        "timeRange": {"from": "now-2h", "to": "now"},
-        "direction": "BULLISH"
-    },
-    timeout=20
-)
+            r = requests.post(
+                "https://altfins.com/api/v2/public/signals-feed/search-requests",
+                headers={"X-API-KEY": ALTFINS_KEY},
+                json={
+                    "timeRange": {"from": "now-2h", "to": "now"},
+                    "direction": "BULLISH"
+                },
+                timeout=20
+            )
 
             print("Status:", r.status_code)
 
@@ -52,4 +52,3 @@ async def start_worker():
 @app.get("/")
 def home():
     return {"status": "altFINS worker running"}
-

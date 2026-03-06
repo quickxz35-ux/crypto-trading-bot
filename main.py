@@ -1204,4 +1204,13 @@ def api_delete_favorite(symbol: str):
             "favorites": favorites,
         }
 
-    raise HTTPException(status_code=404, detail="Favorite not found")
+    raise HTTPException(status_code=404, detail="Favorite not found"
+
+@app.get("/debug/binance")
+def debug_binance():
+    import requests
+    r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    return {
+        "status": r.status_code,
+        "text_sample": r.text[:200]
+    }

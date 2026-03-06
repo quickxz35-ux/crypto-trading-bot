@@ -11,6 +11,8 @@ ALTFINS_KEY = os.getenv("ALTFINS_API_KEY")
 latest_top_10 = []
 favorites = []
 
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
+
 
 def parse_number(value):
     if value is None:
@@ -44,6 +46,14 @@ def safe_post_json(url, json_body=None, headers=None, timeout=20):
     return None
 
 
+def pct_change(current, previous):
+    current = parse_number(current)
+    previous = parse_number(previous)
+    if previous <= 0:
+        return 0.0
+    return ((current - previous) / previous) * 100.0
+
+
 def score_signal(item):
     score = 0
 
@@ -54,10 +64,8 @@ def score_signal(item):
 
     if direction != "BULLISH":
         return -999
-
     if price_change <= 0:
         return -999
-
     if market_cap < 25000000:
         return -999
 
@@ -73,7 +81,6 @@ def score_signal(item):
 
     if "Bull Power" in signal_name:
         score += 15
-
     if "Oversold" in signal_name:
         score += 12
 
@@ -105,6 +112,13 @@ def get_open_interest(symbol):
     return safe_get_json(
         "https://fapi.binance.com/fapi/v1/openInterest",
         params={"symbol": symbol}
+    )
+
+
+def get_open_interest_hist(symbol, period="5m", limit=2):
+    return safe_get_json(
+        "https://fapi.binance.com/futures/data/openInterestHist",
+        params={"symbol": symbol, "period": period, "limit": limit}
     )
 
 
@@ -152,63 +166,46 @@ def get_altfins_signal_map():
 def compute_volume_change_percent(klines):
     if not isinstance(klines, list) or len(klines) < 2:
         return 0.0
-
     prev_vol = parse_number(klines[-2][5])
     last_vol = parse_number(klines[-1][5])
-
     if prev_vol <= 0:
         return 0.0
-
     return ((last_vol - prev_vol) / prev_vol) * 100.0
 
 
-def compute_price_change_5m(klines):
+def compute_price_change_tf(klines):
     if not isinstance(klines, list) or len(klines) < 1:
         return 0.0
-
     open_price = parse_number(klines[-1][1])
     close_price = parse_number(klines[-1][4])
-
     if open_price <= 0:
         return 0.0
-
     return ((close_price - open_price) / open_price) * 100.0
 
 
-def compute_taker_buy_ratio(taker_data):
-    if not isinstance(taker_data, list) or len(taker_data) < 1:
+def compute_ratio_change(data, field):
+    if not isinstance(data, list) or len(data) < 2:
         return 0.0
-
-    row = taker_data[-1]
-    buy = parse_number(row.get("buySellRatio"))
-    return buy
-
-
-def compute_long_short_ratio(ls_data):
-    if not isinstance(ls_data, list) or len(ls_data) < 1:
-        return 0.0
-
-    return parse_number(ls_data[-1].get("longShortRatio"))
+    prev_val = parse_number(data[-2].get(field))
+    last_val = parse_number(data[-1].get(field))
+    return pct_change(last_val, prev_val)
 
 
-def compute_top_trader_ratio(top_data):
-    if not isinstance(top_data, list) or len(top_data) < 1:
-        return 0.0
+def get_coin_metrics(base_symbol, tf="5m"):
+    if tf not in TIMEFRAMES:
+        tf = "5m"
 
-    return parse_number(top_data[-1].get("longShortRatio"))
-
-
-def get_coin_metrics(base_symbol):
     spot_symbol = f"{base_symbol.upper()}USDT"
 
     spot24 = get_binance_spot_24h(spot_symbol)
-    klines = get_binance_spot_klines(spot_symbol, interval="5m", limit=3)
+    klines = get_binance_spot_klines(spot_symbol, interval=tf, limit=3)
 
     futures24 = get_futures_24h(spot_symbol)
     oi = get_open_interest(spot_symbol)
-    ls = get_long_short_ratio(spot_symbol, period="5m", limit=2)
-    top_ls = get_top_trader_ratio(spot_symbol, period="5m", limit=2)
-    taker = get_taker_buy_sell_volume(spot_symbol, period="5m", limit=2)
+    oi_hist = get_open_interest_hist(spot_symbol, period=tf, limit=2)
+    ls = get_long_short_ratio(spot_symbol, period=tf, limit=2)
+    top_ls = get_top_trader_ratio(spot_symbol, period=tf, limit=2)
+    taker = get_taker_buy_sell_volume(spot_symbol, period=tf, limit=2)
 
     last_price = "N/A"
     price_change_24h = "N/A"
@@ -224,59 +221,93 @@ def get_coin_metrics(base_symbol):
         price_change_24h = futures24.get("priceChangePercent", "N/A")
         volume_24h = futures24.get("volume", "N/A")
 
-    volume_change_5m = round(compute_volume_change_percent(klines), 2)
-    price_change_5m = round(compute_price_change_5m(klines), 2)
+    price_change_tf = round(compute_price_change_tf(klines), 2)
+    volume_change_tf = round(compute_volume_change_percent(klines), 2)
 
     oi_value = "N/A"
     if isinstance(oi, dict):
         oi_value = oi.get("openInterest", "N/A")
 
-    long_short = round(compute_long_short_ratio(ls), 3)
-    top_ratio = round(compute_top_trader_ratio(top_ls), 3)
-    taker_ratio = round(compute_taker_buy_ratio(taker), 3)
+    oi_change_pct = 0.0
+    if isinstance(oi_hist, list) and len(oi_hist) >= 2:
+        prev_oi = parse_number(oi_hist[-2].get("sumOpenInterest"))
+        last_oi = parse_number(oi_hist[-1].get("sumOpenInterest"))
+        oi_change_pct = round(pct_change(last_oi, prev_oi), 2)
+
+    long_short_ratio = 0.0
+    long_short_change_pct = 0.0
+    if isinstance(ls, list) and len(ls) >= 1:
+        long_short_ratio = round(parse_number(ls[-1].get("longShortRatio")), 3)
+        long_short_change_pct = round(compute_ratio_change(ls, "longShortRatio"), 2)
+
+    top_trader_ratio = 0.0
+    if isinstance(top_ls, list) and len(top_ls) >= 1:
+        top_trader_ratio = round(parse_number(top_ls[-1].get("longShortRatio")), 3)
+
+    buy_sell_ratio = 0.0
+    buy_sell_change_pct = 0.0
+    if isinstance(taker, list) and len(taker) >= 1:
+        buy_sell_ratio = round(parse_number(taker[-1].get("buySellRatio")), 3)
+        buy_sell_change_pct = round(compute_ratio_change(taker, "buySellRatio"), 2)
 
     volume_explosion_score = 0
-    if price_change_5m > 0:
-        volume_explosion_score += min(price_change_5m * 15, 25)
-    if volume_change_5m > 0:
-        volume_explosion_score += min(volume_change_5m * 0.6, 35)
-    if taker_ratio > 1:
-        volume_explosion_score += min((taker_ratio - 1) * 40, 20)
-    if long_short > 1:
-        volume_explosion_score += min((long_short - 1) * 25, 10)
-    if top_ratio > 1:
-        volume_explosion_score += min((top_ratio - 1) * 20, 10)
+    if price_change_tf > 0:
+        volume_explosion_score += min(price_change_tf * 15, 25)
+    if volume_change_tf > 0:
+        volume_explosion_score += min(volume_change_tf * 0.6, 35)
+    if buy_sell_ratio > 1:
+        volume_explosion_score += min((buy_sell_ratio - 1) * 40, 20)
+    if oi_change_pct > 0:
+        volume_explosion_score += min(oi_change_pct * 0.8, 20)
 
     volume_explosion_score = round(volume_explosion_score, 2)
 
     smart_money_label = "Neutral"
-    if top_ratio >= 1.2 and taker_ratio >= 1.05:
+    if top_trader_ratio >= 1.2 and buy_sell_ratio >= 1.05 and oi_change_pct > 0:
         smart_money_label = "Bullish"
-    elif top_ratio <= 0.9 and taker_ratio <= 0.95:
+    elif top_trader_ratio <= 0.9 and buy_sell_ratio <= 0.95 and oi_change_pct < 0:
         smart_money_label = "Bearish"
 
     entry_bias = "Wait"
-    if price_change_5m > 0.25 and volume_change_5m > 15 and taker_ratio > 1.05:
+    if price_change_tf > 0.25 and volume_change_tf > 15 and buy_sell_ratio > 1.05 and oi_change_pct > 0:
         entry_bias = "Breakout watch"
-    if price_change_5m < 0.15 and volume_change_5m > 15 and taker_ratio > 1.05:
+    elif volume_change_tf > 15 and buy_sell_ratio > 1.05 and oi_change_pct > 0:
         entry_bias = "Pullback watch"
 
     return {
         "symbol": base_symbol.upper(),
         "pair": spot_symbol,
+        "tf": tf,
         "last_price": last_price,
         "price_change_24h": price_change_24h,
         "volume_24h": volume_24h,
-        "price_change_5m": price_change_5m,
-        "volume_change_5m": volume_change_5m,
+        "price_change_tf": price_change_tf,
+        "volume_change_tf": volume_change_tf,
         "open_interest": oi_value,
-        "long_short_ratio": long_short,
-        "top_trader_ratio": top_ratio,
-        "taker_ratio": taker_ratio,
+        "oi_change_pct": oi_change_pct,
+        "long_short_ratio": long_short_ratio,
+        "long_short_change_pct": long_short_change_pct,
+        "top_trader_ratio": top_trader_ratio,
+        "buy_sell_ratio": buy_sell_ratio,
+        "buy_sell_change_pct": buy_sell_change_pct,
         "volume_explosion_score": volume_explosion_score,
         "smart_money_label": smart_money_label,
         "entry_bias": entry_bias,
     }
+
+
+def tf_dropdown(selected_tf, path):
+    options = ""
+    for tf in TIMEFRAMES:
+        selected = "selected" if tf == selected_tf else ""
+        options += f'<option value="{tf}" {selected}>{tf}</option>'
+    return f"""
+    <form method="get" action="{path}" style="margin:10px 0 20px 0;">
+        <label style="margin-right:10px;">Timeframe:</label>
+        <select name="tf" style="padding:8px;">{options}</select>
+        <button type="submit" style="padding:8px 14px;">Apply</button>
+    </form>
+    """
 
 
 async def altfins_worker():
@@ -305,11 +336,7 @@ async def altfins_worker():
                     item["score"] = round(score, 2)
                     scored.append(item)
 
-            latest_top_10 = sorted(
-                scored,
-                key=lambda x: x["score"],
-                reverse=True
-            )[:10]
+            latest_top_10 = sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
 
         except Exception as e:
             print("Worker error:", e)
@@ -372,7 +399,7 @@ def dashboard():
             <td>{item.get('priceChange')}</td>
             <td>{item.get('marketCap')}</td>
             <td>{item.get('score')}</td>
-            <td><a href="/analyze?symbol={symbol}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/analyze?symbol={symbol}&tf=5m" style="color:#38bdf8;">Analyze</a></td>
             <td>
                 <a href="/favorite?symbol={symbol}&signal={item.get('signalName')}&change={item.get('priceChange')}&market_cap={item.get('marketCap')}&score={item.get('score')}"
                    style="color:#facc15;text-decoration:none;font-weight:bold;">⭐ Add</a>
@@ -401,11 +428,22 @@ def dashboard():
         <h1>Top 10 Crypto Opportunities</h1>
         <div class="nav">
             <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites">⭐ Favorites</a>
-            <a href="/volume-explosions">⚡ Volume Explosions</a>
+            <a href="/favorites?tf=5m">⭐ Favorites</a>
+            <a href="/volume-explosions?tf=5m">⚡ Volume Explosions</a>
         </div>
         <form action="/analyze" method="get" style="margin:20px 0;">
             <input name="symbol" placeholder="Enter coin, e.g. BTC or SOL" />
+            <select name="tf" style="padding:10px;">
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="30m">30m</option>
+                <option value="1h">1h</option>
+                <option value="2h">2h</option>
+                <option value="4h">4h</option>
+                <option value="6h">6h</option>
+                <option value="12h">12h</option>
+                <option value="1d">1d</option>
+            </select>
             <button type="submit">Analyze</button>
         </form>
         <p>Auto-refreshes every 30 seconds</p>
@@ -429,11 +467,11 @@ def dashboard():
 
 
 @app.get("/favorites", response_class=HTMLResponse)
-def favorites_page():
+def favorites_page(tf: str = Query("5m")):
     rows = ""
 
     for i, item in enumerate(favorites, start=1):
-        m = get_coin_metrics(item.get("symbol"))
+        m = get_coin_metrics(item.get("symbol"), tf=tf)
         smart_color = "#16a34a" if m["smart_money_label"] == "Bullish" else "#f87171" if m["smart_money_label"] == "Bearish" else "#eab308"
 
         rows += f"""
@@ -441,15 +479,18 @@ def favorites_page():
             <td>{i}</td>
             <td>{item.get('symbol')}</td>
             <td>{m.get('last_price')}</td>
-            <td>{m.get('price_change_5m')}%</td>
-            <td>{m.get('volume_change_5m')}%</td>
-            <td>{m.get('taker_ratio')}</td>
+            <td>{m.get('price_change_tf')}%</td>
+            <td>{m.get('volume_change_tf')}%</td>
+            <td>{m.get('oi_change_pct')}%</td>
+            <td>{m.get('buy_sell_ratio')}</td>
+            <td>{m.get('buy_sell_change_pct')}%</td>
             <td>{m.get('long_short_ratio')}</td>
+            <td>{m.get('long_short_change_pct')}%</td>
             <td>{m.get('top_trader_ratio')}</td>
             <td style="color:{smart_color};font-weight:bold;">{m.get('smart_money_label')}</td>
             <td>{m.get('entry_bias')}</td>
             <td>{m.get('volume_explosion_score')}</td>
-            <td><a href="/analyze?symbol={item.get('symbol')}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/analyze?symbol={item.get('symbol')}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
             <td><a href="/remove_favorite?symbol={item.get('symbol')}" style="color:#f87171;">Remove</a></td>
         </tr>
         """
@@ -473,18 +514,22 @@ def favorites_page():
         <h1>⭐ Favorite Coins</h1>
         <div class="nav">
             <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites">⭐ Favorites</a>
-            <a href="/volume-explosions">⚡ Volume Explosions</a>
+            <a href="/favorites?tf={tf}">⭐ Favorites</a>
+            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
         </div>
+        {tf_dropdown(tf, "/favorites")}
         <table>
             <tr>
                 <th>#</th>
                 <th>Coin</th>
                 <th>Price</th>
-                <th>5m %</th>
-                <th>5m Vol %</th>
-                <th>Taker</th>
+                <th>{tf} %</th>
+                <th>{tf} Vol %</th>
+                <th>OI Δ %</th>
+                <th>Buy/Sell</th>
+                <th>Buy/Sell Δ %</th>
                 <th>L/S</th>
+                <th>L/S Δ %</th>
                 <th>Top Trader</th>
                 <th>Smart Money</th>
                 <th>Entry Bias</th>
@@ -492,7 +537,7 @@ def favorites_page():
                 <th>Analyze</th>
                 <th>Action</th>
             </tr>
-            {rows if rows else "<tr><td colspan='13'>No favorites yet.</td></tr>"}
+            {rows if rows else "<tr><td colspan='16'>No favorites yet.</td></tr>"}
         </table>
     </body>
     </html>
@@ -500,13 +545,13 @@ def favorites_page():
 
 
 @app.get("/volume-explosions", response_class=HTMLResponse)
-def volume_explosions():
+def volume_explosions(tf: str = Query("5m")):
     rows = ""
 
     ranked = []
     for item in latest_top_10:
         symbol = item.get("symbol")
-        m = get_coin_metrics(symbol)
+        m = get_coin_metrics(symbol, tf=tf)
         ranked.append(m)
 
     ranked = sorted(ranked, key=lambda x: x["volume_explosion_score"], reverse=True)
@@ -517,14 +562,17 @@ def volume_explosions():
             <td>{i}</td>
             <td>{m.get('symbol')}</td>
             <td>{m.get('last_price')}</td>
-            <td>{m.get('price_change_5m')}%</td>
-            <td>{m.get('volume_change_5m')}%</td>
-            <td>{m.get('taker_ratio')}</td>
+            <td>{m.get('price_change_tf')}%</td>
+            <td>{m.get('volume_change_tf')}%</td>
+            <td>{m.get('oi_change_pct')}%</td>
+            <td>{m.get('buy_sell_ratio')}</td>
+            <td>{m.get('buy_sell_change_pct')}%</td>
             <td>{m.get('long_short_ratio')}</td>
+            <td>{m.get('long_short_change_pct')}%</td>
             <td>{m.get('top_trader_ratio')}</td>
             <td>{m.get('volume_explosion_score')}</td>
             <td>{m.get('entry_bias')}</td>
-            <td><a href="/analyze?symbol={m.get('symbol')}" style="color:#38bdf8;">Analyze</a></td>
+            <td><a href="/analyze?symbol={m.get('symbol')}&tf={tf}" style="color:#38bdf8;">Analyze</a></td>
         </tr>
         """
 
@@ -546,24 +594,28 @@ def volume_explosions():
         <h1>⚡ Volume Explosion Scanner</h1>
         <div class="nav">
             <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites">⭐ Favorites</a>
-            <a href="/volume-explosions">⚡ Volume Explosions</a>
+            <a href="/favorites?tf={tf}">⭐ Favorites</a>
+            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
         </div>
+        {tf_dropdown(tf, "/volume-explosions")}
         <table>
             <tr>
                 <th>Rank</th>
                 <th>Coin</th>
                 <th>Price</th>
-                <th>5m %</th>
-                <th>5m Vol %</th>
-                <th>Taker</th>
+                <th>{tf} %</th>
+                <th>{tf} Vol %</th>
+                <th>OI Δ %</th>
+                <th>Buy/Sell</th>
+                <th>Buy/Sell Δ %</th>
                 <th>L/S</th>
+                <th>L/S Δ %</th>
                 <th>Top Trader</th>
                 <th>Explosion</th>
                 <th>Entry Bias</th>
                 <th>Analyze</th>
             </tr>
-            {rows if rows else "<tr><td colspan='11'>No data yet.</td></tr>"}
+            {rows if rows else "<tr><td colspan='14'>No data yet.</td></tr>"}
         </table>
     </body>
     </html>
@@ -571,9 +623,9 @@ def volume_explosions():
 
 
 @app.get("/analyze", response_class=HTMLResponse)
-def analyze(symbol: str = Query(...)):
+def analyze(symbol: str = Query(...), tf: str = Query("5m")):
     symbol = symbol.upper()
-    metrics = get_coin_metrics(symbol)
+    metrics = get_coin_metrics(symbol, tf=tf)
     signal_map = get_altfins_signal_map()
     alt_signal = signal_map.get(symbol, {})
 
@@ -583,13 +635,13 @@ def analyze(symbol: str = Query(...)):
     signal_market_cap = alt_signal.get("marketCap", "N/A")
 
     entry_zone = "Wait for confirmation"
-    invalidation = "Below recent 5m low"
+    invalidation = f"Below recent {tf} low"
 
     if metrics["entry_bias"] == "Breakout watch":
-        entry_zone = "Enter on break of local high with volume confirmation"
+        entry_zone = "Enter on break of local high with volume + OI confirmation"
         invalidation = "Lose breakout level / weak taker flow"
     elif metrics["entry_bias"] == "Pullback watch":
-        entry_zone = "Watch pullback into support / reclaim"
+        entry_zone = "Watch pullback into support / reclaim with positive flow"
         invalidation = "Break below pullback support"
 
     return f"""
@@ -606,11 +658,15 @@ def analyze(symbol: str = Query(...)):
     <body>
         <div class="nav">
             <a href="/dashboard">📊 New Scan</a>
-            <a href="/favorites">⭐ Favorites</a>
-            <a href="/volume-explosions">⚡ Volume Explosions</a>
+            <a href="/favorites?tf={tf}">⭐ Favorites</a>
+            <a href="/volume-explosions?tf={tf}">⚡ Volume Explosions</a>
         </div>
 
         <h1>{symbol} Trade Analysis</h1>
+        {tf_dropdown(tf, "/analyze")}
+        <form method="get" action="/analyze" style="display:none;">
+            <input type="hidden" name="symbol" value="{symbol}">
+        </form>
 
         <div class="card">
             <h2>Market</h2>
@@ -618,16 +674,19 @@ def analyze(symbol: str = Query(...)):
             <p>Last Price: {metrics.get('last_price')}</p>
             <p>24h Change: {metrics.get('price_change_24h')}%</p>
             <p>24h Volume: {metrics.get('volume_24h')}</p>
-            <p>5m Change: {metrics.get('price_change_5m')}%</p>
-            <p>5m Volume Change: {metrics.get('volume_change_5m')}%</p>
+            <p>{tf} Price Change: {metrics.get('price_change_tf')}%</p>
+            <p>{tf} Volume Change: {metrics.get('volume_change_tf')}%</p>
         </div>
 
         <div class="card">
             <h2>Order Flow / Derivatives</h2>
             <p>Open Interest: {metrics.get('open_interest')}</p>
-            <p>Global Long/Short Ratio: {metrics.get('long_short_ratio')}</p>
+            <p>OI Change %: {metrics.get('oi_change_pct')}%</p>
+            <p>Buy/Sell Ratio: {metrics.get('buy_sell_ratio')}</p>
+            <p>Buy/Sell Change %: {metrics.get('buy_sell_change_pct')}%</p>
+            <p>Long/Short Ratio: {metrics.get('long_short_ratio')}</p>
+            <p>Long/Short Change %: {metrics.get('long_short_change_pct')}%</p>
             <p>Top Trader Ratio: {metrics.get('top_trader_ratio')}</p>
-            <p>Taker Buy/Sell Ratio: {metrics.get('taker_ratio')}</p>
             <p>Smart Money: {metrics.get('smart_money_label')}</p>
             <p>Volume Explosion Score: {metrics.get('volume_explosion_score')}</p>
         </div>
@@ -648,4 +707,12 @@ def analyze(symbol: str = Query(...)):
         </div>
     </body>
     </html>
-    """
+    """.replace(
+        '<select name="tf" style="padding:8px;">',
+        f'<form method="get" action="/analyze" style="margin:10px 0 20px 0;"><input type="hidden" name="symbol" value="{symbol}"><label style="margin-right:10px;">Timeframe:</label><select name="tf" style="padding:8px;">',
+        1
+    ).replace(
+        "</form>",
+        '<button type="submit" style="padding:8px 14px;">Apply</button></form>',
+        1
+    )

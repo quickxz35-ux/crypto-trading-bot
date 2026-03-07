@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 app = FastAPI(title="Crypto Favorites Watchlist")
 
-TIMEFRAME_OPTIONS = ["1h", "30m", "15m", "5m"]
+TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m"]
 favorites = []
 
 data_cache = TTLCache(maxsize=3000, ttl=30)
@@ -686,3 +686,4 @@ def debug(coin: str = Query("BTC"), tf: str = Query("15m")):
         "timeframe": tf,
         "coin_result": analyze_coin(coin.upper().strip(), tf),
     }
+

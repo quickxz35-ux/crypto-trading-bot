@@ -24,7 +24,7 @@ def safe_get_json(url, params=None, timeout=10):
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 200:
             return r.json()
-        print("GET FAILED:", url, r.status_code, r.text[:200])
+        print("GET FAILED:", url, r.status_code, r.text[:300])
     except Exception as e:
         print("GET ERROR:", url, str(e))
     return None
@@ -207,14 +207,15 @@ def get_long_short(coin, tf):
         if "longs" in data or "shorts" in data:
             long_pct = parse_float(data.get("longs"), None)
             short_pct = parse_float(data.get("shorts"), None)
-        elif isinstance(data.get("data"), list) and data["data"]:
-            item = data["data"][0]
-            long_pct = parse_float(item.get("longs"), None)
-            short_pct = parse_float(item.get("shorts"), None)
         elif isinstance(data.get("data"), dict):
-            item = data["data"]
-            long_pct = parse_float(item.get("longs"), None)
-            short_pct = parse_float(item.get("shorts"), None)
+            inner = data["data"]
+            long_pct = parse_float(inner.get("longs"), None)
+            short_pct = parse_float(inner.get("shorts"), None)
+        elif isinstance(data.get("data"), list) and data["data"]:
+            inner = data["data"][0]
+            if isinstance(inner, dict):
+                long_pct = parse_float(inner.get("longs"), None)
+                short_pct = parse_float(inner.get("shorts"), None)
 
     result = (long_pct, short_pct)
     data_cache[cache_key] = result
@@ -235,37 +236,75 @@ def get_orderbook(coin):
     }
 
     data = safe_get_json("https://api.cryptometer.io/merged-orderbook/", params=params)
-
-    bids_total = 0.0
-    asks_total = 0.0
+    print("ORDERBOOK RAW:", coin, data)
 
     def sum_book_side(entries):
-        total = 0.0
-        for x in entries or []:
-            if isinstance(x, (list, tuple)) and len(x) >= 2:
-                total += parse_float(x[1], 0.0) or 0.0
-            elif isinstance(x, dict):
-                total += parse_float(
-                    x.get("amount", x.get("qty", x.get("quantity", x.get("size")))),
-                    0.0
-                ) or 0.0
-        return total
+        if entries is None:
+            return 0.0
+
+        if isinstance(entries, (int, float)):
+            return float(entries)
+
+        if isinstance(entries, str):
+            f = parse_float(entries, None)
+            return f if f is not None else 0.0
+
+        if isinstance(entries, dict):
+            total = 0.0
+            for _, v in entries.items():
+                if isinstance(v, (int, float)):
+                    total += float(v)
+                elif isinstance(v, str):
+                    total += parse_float(v, 0.0) or 0.0
+                elif isinstance(v, (list, tuple)) and len(v) >= 2:
+                    total += parse_float(v[1], 0.0) or 0.0
+                elif isinstance(v, dict):
+                    total += parse_float(
+                        v.get("amount", v.get("qty", v.get("quantity", v.get("size")))),
+                        0.0
+                    ) or 0.0
+            return total
+
+        if isinstance(entries, list):
+            total = 0.0
+            for x in entries:
+                if isinstance(x, (list, tuple)) and len(x) >= 2:
+                    total += parse_float(x[1], 0.0) or 0.0
+                elif isinstance(x, dict):
+                    total += parse_float(
+                        x.get("amount", x.get("qty", x.get("quantity", x.get("size")))),
+                        0.0
+                    ) or 0.0
+                elif isinstance(x, (int, float)):
+                    total += float(x)
+                elif isinstance(x, str):
+                    total += parse_float(x, 0.0) or 0.0
+            return total
+
+        return 0.0
+
+    bids_total = None
+    asks_total = None
 
     if isinstance(data, dict):
         if "bids" in data or "asks" in data:
-            bids_total = sum_book_side(data.get("bids", []))
-            asks_total = sum_book_side(data.get("asks", []))
+            bids_total = sum_book_side(data.get("bids"))
+            asks_total = sum_book_side(data.get("asks"))
         elif isinstance(data.get("data"), dict):
-            inner = data["data"]
-            bids_total = sum_book_side(inner.get("bids", []))
-            asks_total = sum_book_side(inner.get("asks", []))
+            inner = data.get("data", {})
+            bids_total = sum_book_side(inner.get("bids"))
+            asks_total = sum_book_side(inner.get("asks"))
         elif isinstance(data.get("data"), list) and data["data"]:
             inner = data["data"][0]
             if isinstance(inner, dict):
-                bids_total = sum_book_side(inner.get("bids", []))
-                asks_total = sum_book_side(inner.get("asks", []))
+                bids_total = sum_book_side(inner.get("bids"))
+                asks_total = sum_book_side(inner.get("asks"))
 
-    result = (bids_total if bids_total > 0 else None, asks_total if asks_total > 0 else None)
+    result = (
+        bids_total if bids_total not in (None, 0) else None,
+        asks_total if asks_total not in (None, 0) else None,
+    )
+
     data_cache[cache_key] = result
     return result
 

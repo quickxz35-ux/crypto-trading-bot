@@ -217,12 +217,24 @@ def analyze_coin(coin, tf):
     oi_abs = abs(oi_change_pct or 0)
     oi_score = clamp((oi_abs / 1.0) * 100.0, 0.0, 100.0)
 
+    breakout_pressure = 0
+    if (compression_score or 0) >= 70:
+        breakout_pressure += 25
+    if volume_score >= 50:
+        breakout_pressure += 25
+    if momentum_score >= 50:
+        breakout_pressure += 25
+    if volatility_score >= 40:
+        breakout_pressure += 25
+    breakout_pressure = clamp(breakout_pressure, 0.0, 100.0)
+
     setup_score = (
-        momentum_score * 0.30 +
-        volume_score * 0.25 +
-        volatility_score * 0.20 +
-        (compression_score or 0) * 0.15 +
-        oi_score * 0.10
+        momentum_score * 0.28 +
+        volume_score * 0.22 +
+        volatility_score * 0.18 +
+        (compression_score or 0) * 0.14 +
+        oi_score * 0.08 +
+        breakout_pressure * 0.10
     )
     setup_score = round(clamp(setup_score, 0.0, 100.0), 1)
 
@@ -243,6 +255,7 @@ def analyze_coin(coin, tf):
         "volume_score": round(volume_score, 1),
         "volatility_score": round(volatility_score, 1),
         "oi_score": round(oi_score, 1),
+        "breakout_pressure": round(breakout_pressure, 1),
         "setup_score": setup_score,
     }
 
@@ -322,7 +335,9 @@ def render_coin_row(coin, tf, index):
     volume_sub = f"{format_num(row['rel_volume'], 2)}x normal" if row["rel_volume"] is not None else "N/A"
     vol_sub = format_num(row["volatility_pct"], 2, "%")
     comp_sub = format_num(row["compression_score"], 0, "%") if row["compression_score"] is not None else "N/A"
+    oi_sub = format_num(row["oi_change_pct"], 2, "%") if row["oi_change_pct"] is not None else "N/A"
     setup_sub = format_num(row["setup_score"], 1)
+    break_sub = format_num(row["breakout_pressure"], 0, "%")
     price_sub = format_num(row["price_change_pct"], 2, "%")
 
     return f"""
@@ -366,6 +381,16 @@ def render_coin_row(coin, tf, index):
             <div class="metric">
                 <div class="metric-title">⭐ Setup Score</div>
                 {metric_bar(row["setup_score"], setup_sub)}
+            </div>
+
+            <div class="metric">
+                <div class="metric-title">🚀 Breakout Pressure</div>
+                {metric_bar(row["breakout_pressure"], break_sub)}
+            </div>
+
+            <div class="metric">
+                <div class="metric-title">💬 OI Read</div>
+                {metric_bar(row["oi_score"], oi_sub)}
             </div>
         </div>
     </div>

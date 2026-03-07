@@ -1,3 +1,4 @@
+import os
 import requests
 from cachetools import TTLCache
 from fastapi import FastAPI, Query
@@ -8,7 +9,9 @@ app = FastAPI(title="Crypto Favorites Watchlist")
 TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m"]
 favorites = []
 
-data_cache = TTLCache(maxsize=3000, ttl=30)
+data_cache = TTLCache(maxsize=5000, ttl=30)
+
+CRYPTOMETER_API_KEY = os.getenv("CRYPTOMETER_API_KEY")
 
 
 # -------------------------------------------------
@@ -21,6 +24,7 @@ def safe_get_json(url, params=None, timeout=10):
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 200:
             return r.json()
+        print("GET FAILED:", url, r.status_code, r.text[:200])
     except Exception as e:
         print("GET ERROR:", url, str(e))
     return None
@@ -57,6 +61,47 @@ def format_num(value, decimals=2, suffix=""):
 
 def tf_to_binance(tf):
     return tf
+
+
+def tf_to_cryptometer(tf):
+    return {
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "d",
+    }.get(tf, "15m")
+
+
+def cryptometer_symbol(coin):
+    mapping = {
+        "BTC": "xbt",
+        "ETH": "eth",
+        "SOL": "sol",
+        "LINK": "link",
+        "DOGE": "doge",
+        "XRP": "xrp",
+        "ADA": "ada",
+        "BNB": "bnb",
+        "AVAX": "avax",
+        "DOT": "dot",
+        "LTC": "ltc",
+        "BCH": "bch",
+        "TRX": "trx",
+        "APT": "apt",
+        "ARB": "arb",
+        "OP": "op",
+        "INJ": "inj",
+        "TIA": "tia",
+        "RUNE": "rune",
+        "SUI": "sui",
+    }
+    return mapping.get(coin.upper(), coin.lower())
+
+
+def cryptometer_orderbook_symbol(coin):
+    return f"{coin.upper()}USDT"
 
 
 # -------------------------------------------------
@@ -135,6 +180,97 @@ def get_binance_oi_change(symbol, tf):
 
 
 # -------------------------------------------------
+# CRYPTOMETER DATA
+# -------------------------------------------------
+
+def get_long_short(coin, tf):
+    cache_key = f"longshort::{coin}::{tf}"
+    if cache_key in data_cache:
+        return data_cache[cache_key]
+
+    if not CRYPTOMETER_API_KEY:
+        return None, None
+
+    params = {
+        "e": "binance_futures",
+        "symbol": cryptometer_symbol(coin),
+        "timeframe": tf_to_cryptometer(tf),
+        "api_key": CRYPTOMETER_API_KEY,
+    }
+
+    data = safe_get_json("https://api.cryptometer.io/long-shorts-data/", params=params)
+
+    long_pct = None
+    short_pct = None
+
+    if isinstance(data, dict):
+        if "longs" in data or "shorts" in data:
+            long_pct = parse_float(data.get("longs"), None)
+            short_pct = parse_float(data.get("shorts"), None)
+        elif isinstance(data.get("data"), list) and data["data"]:
+            item = data["data"][0]
+            long_pct = parse_float(item.get("longs"), None)
+            short_pct = parse_float(item.get("shorts"), None)
+        elif isinstance(data.get("data"), dict):
+            item = data["data"]
+            long_pct = parse_float(item.get("longs"), None)
+            short_pct = parse_float(item.get("shorts"), None)
+
+    result = (long_pct, short_pct)
+    data_cache[cache_key] = result
+    return result
+
+
+def get_orderbook(coin):
+    cache_key = f"orderbook::{coin}"
+    if cache_key in data_cache:
+        return data_cache[cache_key]
+
+    if not CRYPTOMETER_API_KEY:
+        return None, None
+
+    params = {
+        "symbol": cryptometer_orderbook_symbol(coin),
+        "api_key": CRYPTOMETER_API_KEY,
+    }
+
+    data = safe_get_json("https://api.cryptometer.io/merged-orderbook/", params=params)
+
+    bids_total = 0.0
+    asks_total = 0.0
+
+    def sum_book_side(entries):
+        total = 0.0
+        for x in entries or []:
+            if isinstance(x, (list, tuple)) and len(x) >= 2:
+                total += parse_float(x[1], 0.0) or 0.0
+            elif isinstance(x, dict):
+                total += parse_float(
+                    x.get("amount", x.get("qty", x.get("quantity", x.get("size")))),
+                    0.0
+                ) or 0.0
+        return total
+
+    if isinstance(data, dict):
+        if "bids" in data or "asks" in data:
+            bids_total = sum_book_side(data.get("bids", []))
+            asks_total = sum_book_side(data.get("asks", []))
+        elif isinstance(data.get("data"), dict):
+            inner = data["data"]
+            bids_total = sum_book_side(inner.get("bids", []))
+            asks_total = sum_book_side(inner.get("asks", []))
+        elif isinstance(data.get("data"), list) and data["data"]:
+            inner = data["data"][0]
+            if isinstance(inner, dict):
+                bids_total = sum_book_side(inner.get("bids", []))
+                asks_total = sum_book_side(inner.get("asks", []))
+
+    result = (bids_total if bids_total > 0 else None, asks_total if asks_total > 0 else None)
+    data_cache[cache_key] = result
+    return result
+
+
+# -------------------------------------------------
 # ANALYSIS
 # -------------------------------------------------
 
@@ -188,6 +324,9 @@ def analyze_coin(coin, tf):
     funding_rate = get_binance_funding(symbol)
     oi_change_pct, open_interest = get_binance_oi_change(symbol, tf)
 
+    long_pct, short_pct = get_long_short(coin, tf)
+    bids_total, asks_total = get_orderbook(coin)
+
     if avg_prev_volume and avg_prev_volume > 0:
         volume_change_pct = ((quote_volume - avg_prev_volume) / avg_prev_volume) * 100.0
         rel_volume = quote_volume / avg_prev_volume
@@ -211,11 +350,23 @@ def analyze_coin(coin, tf):
     vol_expansion = None
     if avg_prev_range and avg_prev_range > 0:
         vol_expansion = volatility_pct / avg_prev_range
-
     volatility_score = clamp((vol_expansion or 0) / 3.0 * 100.0, 0.0, 100.0)
 
     oi_abs = abs(oi_change_pct or 0)
     oi_score = clamp((oi_abs / 1.0) * 100.0, 0.0, 100.0)
+
+    long_short_score = None
+    if long_pct is not None and short_pct is not None:
+        long_short_score = clamp(abs(long_pct - 50.0) * 2.0, 0.0, 100.0)
+
+    orderbook_score = None
+    orderbook_bias_pct = None
+    if bids_total is not None and asks_total is not None:
+        total_liq = bids_total + asks_total
+        if total_liq > 0:
+            bid_share = (bids_total / total_liq) * 100.0
+            orderbook_bias_pct = round(bid_share, 1)
+            orderbook_score = clamp(abs(bid_share - 50.0) * 2.0, 0.0, 100.0)
 
     breakout_pressure = 0
     if (compression_score or 0) >= 70:
@@ -239,16 +390,37 @@ def analyze_coin(coin, tf):
         liquidation_pressure += 20
     liquidation_pressure = clamp(liquidation_pressure, 0.0, 100.0)
 
+    alignment_bonus = 0
+    if momentum_score >= 50 and volume_score >= 50 and (compression_score or 0) >= 60:
+        alignment_bonus += 8
+    if oi_score >= 35 and (long_short_score or 0) >= 35:
+        alignment_bonus += 5
+    if (orderbook_score or 0) >= 35 and breakout_pressure >= 50:
+        alignment_bonus += 5
+
     setup_score = (
-        momentum_score * 0.25 +
-        volume_score * 0.20 +
-        volatility_score * 0.15 +
-        (compression_score or 0) * 0.12 +
+        momentum_score * 0.22 +
+        volume_score * 0.18 +
+        volatility_score * 0.12 +
+        (compression_score or 0) * 0.10 +
         oi_score * 0.08 +
         breakout_pressure * 0.10 +
-        liquidation_pressure * 0.10
-    )
+        liquidation_pressure * 0.10 +
+        (long_short_score or 0) * 0.05 +
+        (orderbook_score or 0) * 0.05
+    ) + alignment_bonus
     setup_score = round(clamp(setup_score, 0.0, 100.0), 1)
+
+    oi_read = "Flat"
+    if oi_change_pct is not None:
+        if price_change_pct > 0 and oi_change_pct > 0:
+            oi_read = "New longs entering"
+        elif price_change_pct < 0 and oi_change_pct > 0:
+            oi_read = "New shorts entering"
+        elif price_change_pct > 0 and oi_change_pct < 0:
+            oi_read = "Shorts closing"
+        elif price_change_pct < 0 and oi_change_pct < 0:
+            oi_read = "Longs closing"
 
     return {
         "coin": coin,
@@ -259,6 +431,7 @@ def analyze_coin(coin, tf):
         "volatility_pct": round(volatility_pct, 2),
         "funding_rate": funding_rate,
         "oi_change_pct": round(oi_change_pct, 2) if oi_change_pct is not None else None,
+        "oi_read": oi_read,
         "open_interest": open_interest,
         "momentum_strength": round(momentum_strength, 2) if momentum_strength is not None else None,
         "rel_volume": round(rel_volume, 2) if rel_volume is not None else None,
@@ -269,6 +442,13 @@ def analyze_coin(coin, tf):
         "oi_score": round(oi_score, 1),
         "breakout_pressure": round(breakout_pressure, 1),
         "liquidation_pressure": round(liquidation_pressure, 1),
+        "long_pct": round(long_pct, 1) if long_pct is not None else None,
+        "short_pct": round(short_pct, 1) if short_pct is not None else None,
+        "long_short_score": round(long_short_score, 1) if long_short_score is not None else None,
+        "orderbook_score": round(orderbook_score, 1) if orderbook_score is not None else None,
+        "orderbook_bias_pct": orderbook_bias_pct,
+        "bids_total": bids_total,
+        "asks_total": asks_total,
         "setup_score": setup_score,
     }
 
@@ -298,7 +478,35 @@ def metric_bar(score, subtitle, width=150, height=10):
     """
 
 
-def oi_centered_bar(score, raw_value, width=150, height=10):
+def centered_bias_bar(raw_pct, subtitle, width=150, height=10):
+    if raw_pct is None:
+        return """
+        <div class="bar-wrap">
+            <div class="bar centered"><div class="bar-mid"></div></div>
+            <div class="tiny">N/A</div>
+        </div>
+        """
+
+    raw = clamp(float(raw_pct), 0.0, 100.0)
+    delta = raw - 50.0
+    max_abs = 50.0
+    half = width / 2
+    fill = (abs(delta) / max_abs) * half
+    left = half if delta >= 0 else half - fill
+    color = "#22c55e" if delta >= 0 else "#ef4444"
+
+    return f"""
+    <div class="bar-wrap">
+        <div class="bar centered" style="width:{width}px;height:{height}px;">
+            <div class="bar-mid"></div>
+            <div class="bar-fill abs" style="left:{left}px;width:{fill}px;background:{color};"></div>
+        </div>
+        <div class="tiny">{subtitle}</div>
+    </div>
+    """
+
+
+def oi_centered_bar(score, raw_value, oi_read, width=150, height=10):
     v = clamp(float(score or 0), 0, 100)
     color, band = band_color(v)
 
@@ -319,7 +527,7 @@ def oi_centered_bar(score, raw_value, width=150, height=10):
             <div class="bar-mid"></div>
             <div class="bar-fill abs" style="left:{left}px;width:{fill}px;background:{color};"></div>
         </div>
-        <div class="tiny">{band} · {arrow} {format_num(raw, 2, '%')} · {meaning}</div>
+        <div class="tiny">{band} · {arrow} {format_num(raw, 2, '%')} · {meaning} · {oi_read}</div>
     </div>
     """
 
@@ -352,6 +560,19 @@ def render_coin_row(coin, tf, index):
     break_sub = format_num(row["breakout_pressure"], 0, "%")
     liq_sub = format_num(row["liquidation_pressure"], 0, "%")
     price_sub = format_num(row["price_change_pct"], 2, "%")
+
+    long_short_sub = "N/A"
+    if row["long_pct"] is not None and row["short_pct"] is not None:
+        long_short_sub = f"{format_num(row['long_pct'], 1, '%')} Long / {format_num(row['short_pct'], 1, '%')} Short"
+
+    orderbook_sub = "N/A"
+    if row["orderbook_bias_pct"] is not None:
+        if row["orderbook_bias_pct"] > 50:
+            orderbook_sub = f"{format_num(row['orderbook_bias_pct'], 1, '%')} bids"
+        elif row["orderbook_bias_pct"] < 50:
+            orderbook_sub = f"{format_num(100 - row['orderbook_bias_pct'], 1, '%')} asks"
+        else:
+            orderbook_sub = "Balanced"
 
     return f"""
     <div class="coin-card" id="coin-card-{coin}">
@@ -387,13 +608,8 @@ def render_coin_row(coin, tf, index):
             </div>
 
             <div class="metric">
-                <div class="metric-title">🧲 OI Flow</div>
-                {oi_centered_bar(row["oi_score"], row["oi_change_pct"])}
-            </div>
-
-            <div class="metric">
-                <div class="metric-title">⭐ Setup Score</div>
-                {metric_bar(row["setup_score"], setup_sub)}
+                <div class="metric-title">🧲 OI Flow / OI Read</div>
+                {oi_centered_bar(row["oi_score"], row["oi_change_pct"], row["oi_read"])}
             </div>
 
             <div class="metric">
@@ -404,6 +620,21 @@ def render_coin_row(coin, tf, index):
             <div class="metric">
                 <div class="metric-title">💣 Liquidation Pressure</div>
                 {metric_bar(row["liquidation_pressure"], liq_sub)}
+            </div>
+
+            <div class="metric">
+                <div class="metric-title">🪖 Long vs Short</div>
+                {centered_bias_bar(row["long_pct"], long_short_sub)}
+            </div>
+
+            <div class="metric">
+                <div class="metric-title">📚 Orderbook Imbalance</div>
+                {centered_bias_bar(row["orderbook_bias_pct"], orderbook_sub)}
+            </div>
+
+            <div class="metric">
+                <div class="metric-title">⭐ Setup Score</div>
+                {metric_bar(row["setup_score"], setup_sub)}
             </div>
         </div>
     </div>
@@ -468,12 +699,6 @@ def base_layout(title, body):
                 border: 1px solid #334155;
                 border-radius: 16px;
                 padding: 16px;
-                transition: box-shadow 0.55s ease, border-color 0.55s ease, transform 0.35s ease;
-            }}
-            .coin-card.updated {{
-                box-shadow: 0 0 18px rgba(56, 189, 248, 0.55);
-                border-color: #38bdf8;
-                transform: translateY(-1px);
             }}
             .coin-header {{
                 display: flex;
@@ -524,6 +749,8 @@ def base_layout(title, body):
                 border: 1px solid #334155;
                 border-radius: 999px;
                 overflow: hidden;
+                width: 150px;
+                height: 10px;
             }}
             .bar.centered {{
                 background: linear-gradient(
@@ -650,10 +877,6 @@ def favorites_page(tf: str = Query("15m")):
 
                     if (oldCard && newCard) {{
                         oldCard.replaceWith(newCard);
-                        newCard.classList.add("updated");
-                        setTimeout(() => {{
-                            newCard.classList.remove("updated");
-                        }}, 650);
                     }}
                 }} catch (e) {{
                     console.log("refresh error", coin, e);
@@ -697,5 +920,6 @@ def debug(coin: str = Query("BTC"), tf: str = Query("15m")):
     return {
         "favorites": favorites,
         "timeframe": tf,
+        "cryptometer_key_present": bool(CRYPTOMETER_API_KEY),
         "coin_result": analyze_coin(coin.upper().strip(), tf),
     }

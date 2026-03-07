@@ -773,7 +773,7 @@ def shortlist_candidates(tf):
 
     candidates = []
     for coin, row in merged.items():
-        if parse_float(row["volume_24h"]) < 1_500_000:
+        if parse_float(row["volume_24h"]) < 3_000_000:
             continue
 
         exchange, symbol = get_primary_exchange_symbol(universe.get(coin, {}).get("exchanges", {}))
@@ -810,7 +810,7 @@ def shortlist_candidates(tf):
         })
 
     candidates.sort(key=lambda x: x["shortlist_score"], reverse=True)
-    return candidates[:90]
+    return candidates[:40]
 
 
 # -------------------------------------------------
@@ -1377,3 +1377,4 @@ def debug(tf: str = Query("15m")):
         "sample_shortlist": shortlist[:5],
         "sample_scan": scan[:5],
     }
+

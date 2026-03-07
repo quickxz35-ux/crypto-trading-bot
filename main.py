@@ -214,7 +214,6 @@ def analyze_coin(coin, tf):
 
     volatility_score = clamp((vol_expansion or 0) / 3.0 * 100.0, 0.0, 100.0)
 
-    # tighter readable OI scaling
     oi_abs = abs(oi_change_pct or 0)
     oi_score = clamp((oi_abs / 1.0) * 100.0, 0.0, 100.0)
 
@@ -431,6 +430,12 @@ def base_layout(title, body):
                 border: 1px solid #334155;
                 border-radius: 16px;
                 padding: 16px;
+                transition: box-shadow 0.55s ease, border-color 0.55s ease, transform 0.35s ease;
+            }}
+            .coin-card.updated {{
+                box-shadow: 0 0 18px rgba(56, 189, 248, 0.55);
+                border-color: #38bdf8;
+                transform: translateY(-1px);
             }}
             .coin-header {{
                 display: flex;
@@ -503,10 +508,12 @@ def base_layout(title, body):
                 position: relative;
                 height: 100%;
                 border-radius: 999px;
+                transition: width 0.45s ease, background-color 0.35s ease;
             }}
             .bar-fill.abs {{
                 position: absolute;
                 top: 0;
+                transition: width 0.45s ease, left 0.45s ease, background-color 0.35s ease;
             }}
             .tiny {{
                 font-size: 11px;
@@ -570,7 +577,10 @@ def favorites_page(tf: str = Query("15m")):
             </form>
 
             <div class="status-row">
-                <div>Universal colors: Gray = weak, Blue = building, Green = strong, Purple = extreme</div>
+                <div>Gray = weak</div>
+                <div>Blue = building</div>
+                <div>Green = strong</div>
+                <div>Purple = extreme</div>
             </div>
         </div>
 
@@ -596,11 +606,16 @@ def favorites_page(tf: str = Query("15m")):
                     const html = await res.text();
                     const wrapper = document.createElement("div");
                     wrapper.innerHTML = html.trim();
+
                     const newCard = wrapper.firstElementChild;
                     const oldCard = document.getElementById(`coin-card-${{coin}}`);
 
                     if (oldCard && newCard) {{
                         oldCard.replaceWith(newCard);
+                        newCard.classList.add("updated");
+                        setTimeout(() => {{
+                            newCard.classList.remove("updated");
+                        }}, 650);
                     }}
                 }} catch (e) {{
                     console.log("refresh error", coin, e);

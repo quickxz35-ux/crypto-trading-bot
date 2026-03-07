@@ -1,4 +1,3 @@
-import math
 import requests
 from cachetools import TTLCache
 from fastapi import FastAPI, Query
@@ -9,7 +8,7 @@ app = FastAPI(title="Crypto Favorites Watchlist")
 TIMEFRAME_OPTIONS = ["1h", "30m", "15m", "5m"]
 favorites = []
 
-data_cache = TTLCache(maxsize=2000, ttl=30)
+data_cache = TTLCache(maxsize=3000, ttl=30)
 
 
 # -------------------------------------------------
@@ -61,11 +60,31 @@ def tf_to_binance(tf):
 
 
 # -------------------------------------------------
-# BINANCE FUTURES ONLY (FAST VERSION)
+# UNIVERSAL COLOR SYSTEM
+# -------------------------------------------------
+
+def band_color(score):
+    s = clamp(float(score), 0, 100)
+    if s < 25:
+        return "#64748b", "Weak"
+    if s < 50:
+        return "#3b82f6", "Building"
+    if s < 75:
+        return "#22c55e", "Strong"
+    return "#a855f7", "Extreme"
+
+
+def bias_badge(bias):
+    color = "#22c55e" if bias == "Bullish" else "#ef4444" if bias == "Bearish" else "#eab308"
+    return f'<span class="bias" style="color:{color};">{bias}</span>'
+
+
+# -------------------------------------------------
+# BINANCE FUTURES DATA
 # -------------------------------------------------
 
 def get_binance_candles(symbol, tf, limit=25):
-    cache_key = f"binance_klines::{symbol}::{tf}::{limit}"
+    cache_key = f"klines::{symbol}::{tf}::{limit}"
     if cache_key in data_cache:
         return data_cache[cache_key]
 
@@ -73,6 +92,7 @@ def get_binance_candles(symbol, tf, limit=25):
         "https://fapi.binance.com/fapi/v1/klines",
         params={"symbol": symbol, "interval": tf_to_binance(tf), "limit": limit},
     )
+
     result = data if isinstance(data, list) else []
     data_cache[cache_key] = result
     return result
@@ -115,7 +135,7 @@ def get_binance_oi_change(symbol, tf):
 
 
 # -------------------------------------------------
-# METRICS
+# ANALYSIS
 # -------------------------------------------------
 
 def analyze_coin(coin, tf):
@@ -135,7 +155,9 @@ def analyze_coin(coin, tf):
     close_price = parse_float(latest[4], None)
     quote_volume = parse_float(latest[7], None)
 
-    if None in (open_price, high_price, low_price, close_price, quote_volume) or low_price <= 0 or open_price <= 0:
+    if None in (open_price, high_price, low_price, close_price, quote_volume):
+        return None
+    if open_price <= 0 or low_price <= 0:
         return None
 
     prev_quote_volumes = [parse_float(c[7], None) for c in prev_20]
@@ -147,7 +169,7 @@ def analyze_coin(coin, tf):
         h = parse_float(c[2], None)
         l = parse_float(c[3], None)
         cl = parse_float(c[4], None)
-        if o and o > 0 and l and l > 0 and cl is not None and h is not None:
+        if o and o > 0 and l and l > 0 and h is not None and cl is not None:
             prev_moves_pct.append(abs((cl - o) / o) * 100.0)
             prev_ranges_pct.append(((h - l) / l) * 100.0)
 
@@ -156,11 +178,13 @@ def analyze_coin(coin, tf):
     avg_prev_move = avg(prev_moves_pct)
 
     price_change_pct = ((close_price - open_price) / open_price) * 100.0
+    volatility_pct = ((high_price - low_price) / low_price) * 100.0
+
     volume_change_pct = None
     rel_volume = None
-    volatility_pct = ((high_price - low_price) / low_price) * 100.0
     momentum_strength = None
     compression_score = None
+
     funding_rate = get_binance_funding(symbol)
     oi_change_pct, open_interest = get_binance_oi_change(symbol, tf)
 
@@ -173,7 +197,6 @@ def analyze_coin(coin, tf):
 
     if avg_prev_range and avg_prev_range > 0:
         compression_ratio = volatility_pct / avg_prev_range
-        # lower current range = more compression
         compression_score = clamp((1.0 - min(compression_ratio, 1.0)) * 100.0, 0.0, 100.0)
 
     bias = "Neutral"
@@ -184,15 +207,23 @@ def analyze_coin(coin, tf):
 
     momentum_score = clamp((momentum_strength or 0) / 3.0 * 100.0, 0.0, 100.0)
     volume_score = clamp((rel_volume or 0) / 3.0 * 100.0, 0.0, 100.0)
-    volatility_score = clamp((volatility_pct / max(avg_prev_range or volatility_pct or 1, 1e-9)) / 3.0 * 100.0, 0.0, 100.0)
-    oi_score = clamp(abs(oi_change_pct or 0) / 8.0 * 100.0, 0.0, 100.0)
+
+    vol_expansion = None
+    if avg_prev_range and avg_prev_range > 0:
+        vol_expansion = volatility_pct / avg_prev_range
+
+    volatility_score = clamp((vol_expansion or 0) / 3.0 * 100.0, 0.0, 100.0)
+
+    # tighter readable OI scaling
+    oi_abs = abs(oi_change_pct or 0)
+    oi_score = clamp((oi_abs / 1.0) * 100.0, 0.0, 100.0)
 
     setup_score = (
-        momentum_score * 0.30
-        + volume_score * 0.25
-        + volatility_score * 0.20
-        + (compression_score or 0) * 0.15
-        + oi_score * 0.10
+        momentum_score * 0.30 +
+        volume_score * 0.25 +
+        volatility_score * 0.20 +
+        (compression_score or 0) * 0.15 +
+        oi_score * 0.10
     )
     setup_score = round(clamp(setup_score, 0.0, 100.0), 1)
 
@@ -221,110 +252,55 @@ def analyze_coin(coin, tf):
 # BAR HTML
 # -------------------------------------------------
 
-def tiny_text(value):
-    return f'<div class="tiny">{value}</div>'
-
-
-def fill_bar(value, max_value=100, width=150, height=10, color="#38bdf8", label=None):
-    if value is None:
-        return '<div class="bar-wrap"><div class="bar empty"></div><div class="tiny">N/A</div></div>'
-    v = clamp(float(value), 0, max_value)
-    fill = (v / max_value) * width
-    shown = label if label is not None else format_num(v, 1)
+def metric_bar(score, subtitle, width=150, height=10):
+    if score is None:
+        return """
+        <div class="bar-wrap">
+            <div class="bar"><div class="bar-fill" style="width:0;"></div></div>
+            <div class="tiny">N/A</div>
+        </div>
+        """
+    v = clamp(float(score), 0, 100)
+    fill = (v / 100.0) * width
+    color, band = band_color(v)
     return f"""
     <div class="bar-wrap">
         <div class="bar" style="width:{width}px;height:{height}px;">
             <div class="bar-fill" style="width:{fill}px;background:{color};"></div>
         </div>
-        <div class="tiny">{shown}</div>
+        <div class="tiny">{band} · {subtitle}</div>
     </div>
     """
 
 
-def centered_bar(value, max_abs=3, width=150, height=10, label=None):
-    if value is None:
-        return '<div class="bar-wrap"><div class="bar centered empty"></div><div class="tiny">N/A</div></div>'
-    v = clamp(float(value), -max_abs, max_abs)
+def oi_centered_bar(score, raw_value, width=150, height=10):
+    v = clamp(float(score or 0), 0, 100)
+    color, band = band_color(v)
+
+    raw = raw_value or 0.0
+    max_abs = 1.0
+    clipped = clamp(float(raw), -max_abs, max_abs)
+
     half = width / 2
-    fill = (abs(v) / max_abs) * half if max_abs > 0 else 0
-    color = "#22c55e" if v > 0 else "#ef4444" if v < 0 else "#64748b"
-    left = half if v >= 0 else half - fill
-    shown = label if label is not None else format_num(value, 2)
+    fill = (abs(clipped) / max_abs) * half
+    left = half if clipped >= 0 else half - fill
+
+    arrow = "▲" if raw > 0 else "▼" if raw < 0 else "•"
+    meaning = "Opening" if raw > 0 else "Closing" if raw < 0 else "Flat"
+
     return f"""
     <div class="bar-wrap">
         <div class="bar centered" style="width:{width}px;height:{height}px;">
             <div class="bar-mid"></div>
             <div class="bar-fill abs" style="left:{left}px;width:{fill}px;background:{color};"></div>
         </div>
-        <div class="tiny">{shown}</div>
+        <div class="tiny">{band} · {arrow} {format_num(raw, 2, '%')} · {meaning}</div>
     </div>
     """
-
-
-def compression_bar(value, width=150, height=10):
-    if value is None:
-        return '<div class="bar-wrap"><div class="bar empty"></div><div class="tiny">N/A</div></div>'
-    v = clamp(float(value), 0, 100)
-
-    if v < 25:
-        color = "#64748b"
-        label = "Loose"
-    elif v < 50:
-        color = "#3b82f6"
-        label = "Tightening"
-    elif v < 75:
-        color = "#8b5cf6"
-        label = "High"
-    else:
-        color = "#c026d3"
-        label = "Extreme"
-
-    fill = (v / 100.0) * width
-    return f"""
-    <div class="bar-wrap">
-        <div class="bar" style="width:{width}px;height:{height}px;">
-            <div class="bar-fill" style="width:{fill}px;background:{color};"></div>
-        </div>
-        <div class="tiny">{label} · {format_num(v, 0, '%')}</div>
-    </div>
-    """
-
-
-def score_bar(value, width=150, height=10):
-    if value is None:
-        return '<div class="bar-wrap"><div class="bar empty"></div><div class="tiny">N/A</div></div>'
-    v = clamp(float(value), 0, 100)
-    if v < 25:
-        color = "#64748b"
-        label = "Weak"
-    elif v < 50:
-        color = "#eab308"
-        label = "Building"
-    elif v < 70:
-        color = "#22c55e"
-        label = "Strong"
-    else:
-        color = "#10b981"
-        label = "Explosive"
-
-    fill = (v / 100.0) * width
-    return f"""
-    <div class="bar-wrap">
-        <div class="bar" style="width:{width}px;height:{height}px;">
-            <div class="bar-fill" style="width:{fill}px;background:{color};"></div>
-        </div>
-        <div class="tiny">{label} · {format_num(v, 1)}</div>
-    </div>
-    """
-
-
-def bias_badge(bias):
-    color = "#22c55e" if bias == "Bullish" else "#ef4444" if bias == "Bearish" else "#eab308"
-    return f'<span class="bias" style="color:{color};">{bias}</span>'
 
 
 # -------------------------------------------------
-# ROW RENDER
+# RENDER
 # -------------------------------------------------
 
 def render_coin_row(coin, tf, index):
@@ -343,18 +319,19 @@ def render_coin_row(coin, tf, index):
         </div>
         """
 
-    momentum_label = f"{format_num(row['momentum_strength'], 2)}x normal" if row["momentum_strength"] is not None else "N/A"
-    volume_label = f"{format_num(row['rel_volume'], 2)}x normal" if row["rel_volume"] is not None else "N/A"
-    oi_label = format_num(row["oi_change_pct"], 2, "%") if row["oi_change_pct"] is not None else "N/A"
-    vol_label = format_num(row["volatility_pct"], 2, "%")
-    price_label = format_num(row["price_change_pct"], 2, "%")
+    momentum_sub = f"{format_num(row['momentum_strength'], 2)}x normal" if row["momentum_strength"] is not None else "N/A"
+    volume_sub = f"{format_num(row['rel_volume'], 2)}x normal" if row["rel_volume"] is not None else "N/A"
+    vol_sub = format_num(row["volatility_pct"], 2, "%")
+    comp_sub = format_num(row["compression_score"], 0, "%") if row["compression_score"] is not None else "N/A"
+    setup_sub = format_num(row["setup_score"], 1)
+    price_sub = format_num(row["price_change_pct"], 2, "%")
 
     return f"""
     <div class="coin-card" id="coin-card-{coin}">
         <div class="coin-header">
             <div>
                 <div class="coin-name">{index}. {row['coin']}</div>
-                <div class="coin-sub">{bias_badge(row['bias'])} · Price {price_label}</div>
+                <div class="coin-sub">{bias_badge(row['bias'])} · Price {price_sub}</div>
             </div>
             <div class="coin-actions">
                 <a class="danger-link" href="/remove?coin={row['coin']}&tf={tf}">Remove</a>
@@ -364,32 +341,32 @@ def render_coin_row(coin, tf, index):
         <div class="bars-grid">
             <div class="metric">
                 <div class="metric-title">⚡ Momentum</div>
-                {fill_bar(row["momentum_score"], max_value=100, color="#22c55e", label=momentum_label)}
+                {metric_bar(row["momentum_score"], momentum_sub)}
             </div>
 
             <div class="metric">
                 <div class="metric-title">🐋 Volume</div>
-                {fill_bar(row["volume_score"], max_value=100, color="#8b5cf6", label=volume_label)}
+                {metric_bar(row["volume_score"], volume_sub)}
             </div>
 
             <div class="metric">
                 <div class="metric-title">🔥 Volatility</div>
-                {fill_bar(row["volatility_score"], max_value=100, color="#f97316", label=vol_label)}
+                {metric_bar(row["volatility_score"], vol_sub)}
             </div>
 
             <div class="metric">
                 <div class="metric-title">📦 Compression</div>
-                {compression_bar(row["compression_score"])}
+                {metric_bar(row["compression_score"], comp_sub)}
             </div>
 
             <div class="metric">
                 <div class="metric-title">🧲 OI Flow</div>
-                {centered_bar(row["oi_change_pct"], max_abs=8, label=oi_label)}
+                {oi_centered_bar(row["oi_score"], row["oi_change_pct"])}
             </div>
 
             <div class="metric">
                 <div class="metric-title">⭐ Setup Score</div>
-                {score_bar(row["setup_score"])}
+                {metric_bar(row["setup_score"], setup_sub)}
             </div>
         </div>
     </div>
@@ -417,14 +394,6 @@ def base_layout(title, body):
             h1 {{
                 color: #38bdf8;
                 margin-bottom: 10px;
-            }}
-            .topbar {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 12px;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 18px;
             }}
             .card {{
                 background: #1e293b;
@@ -479,12 +448,10 @@ def base_layout(title, body):
                 font-size: 13px;
                 margin-top: 4px;
             }}
-            .coin-actions a {{
-                text-decoration: none;
-            }}
             .danger-link {{
                 color: #f87171;
                 font-weight: 700;
+                text-decoration: none;
             }}
             .bars-grid {{
                 display: grid;
@@ -518,14 +485,10 @@ def base_layout(title, body):
             .bar.centered {{
                 background: linear-gradient(
                     to right,
-                    rgba(239,68,68,0.10) 0%,
+                    rgba(239,68,68,0.08) 0%,
                     rgba(2,6,23,1) 50%,
-                    rgba(34,197,94,0.10) 100%
+                    rgba(34,197,94,0.08) 100%
                 );
-            }}
-            .bar.empty {{
-                width: 150px;
-                height: 10px;
             }}
             .bar-mid {{
                 position: absolute;
@@ -558,7 +521,7 @@ def base_layout(title, body):
                 gap: 14px;
                 font-size: 12px;
                 color: #94a3b8;
-                margin-top: 6px;
+                margin-top: 8px;
             }}
         </style>
     </head>
@@ -588,12 +551,8 @@ def favorites_page(tf: str = Query("15m")):
         rows_html += render_coin_row(coin, tf, i)
 
     body = f"""
-        <div class="topbar">
-            <div>
-                <h1>⭐ Favorites Watchlist</h1>
-                <div class="muted">Background refresh updates one coin at a time.</div>
-            </div>
-        </div>
+        <h1>⭐ Favorites Watchlist</h1>
+        <div class="muted" style="margin-bottom:12px;">Background refresh updates one coin at a time.</div>
 
         <div class="card">
             <form class="controls" method="get" action="/favorites">
@@ -611,12 +570,7 @@ def favorites_page(tf: str = Query("15m")):
             </form>
 
             <div class="status-row">
-                <div>⚡ Momentum = move vs normal move</div>
-                <div>🐋 Volume = current volume vs normal volume</div>
-                <div>🔥 Volatility = range expansion</div>
-                <div>📦 Compression = breakout pressure</div>
-                <div>🧲 OI Flow = open interest change</div>
-                <div>⭐ Setup Score = combined setup quality</div>
+                <div>Universal colors: Gray = weak, Blue = building, Green = strong, Purple = extreme</div>
             </div>
         </div>
 
@@ -643,8 +597,8 @@ def favorites_page(tf: str = Query("15m")):
                     const wrapper = document.createElement("div");
                     wrapper.innerHTML = html.trim();
                     const newCard = wrapper.firstElementChild;
-
                     const oldCard = document.getElementById(`coin-card-${{coin}}`);
+
                     if (oldCard && newCard) {{
                         oldCard.replaceWith(newCard);
                     }}

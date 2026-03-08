@@ -1,6 +1,7 @@
 import os
 import requests
 from cachetools import TTLCache
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
@@ -236,7 +237,6 @@ def get_orderbook(coin):
     }
 
     data = safe_get_json("https://api.cryptometer.io/merged-orderbook/", params=params)
-    print("ORDERBOOK RAW:", coin, data)
 
     def sum_book_side(entries):
         if entries is None:
@@ -352,6 +352,18 @@ def analyze_coin(coin, tf):
     avg_prev_range = avg(prev_ranges_pct)
     avg_prev_move = avg(prev_moves_pct)
 
+    # Parallelize independent API calls
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        funding_future = executor.submit(get_binance_funding, symbol)
+        oi_future = executor.submit(get_binance_oi_change, symbol, tf)
+        long_short_future = executor.submit(get_long_short, coin, tf)
+        orderbook_future = executor.submit(get_orderbook, coin)
+
+        funding_rate = funding_future.result()
+        oi_change_pct, open_interest = oi_future.result()
+        long_pct, short_pct = long_short_future.result()
+        bids_total, asks_total = orderbook_future.result()
+
     price_change_pct = ((close_price - open_price) / open_price) * 100.0
     volatility_pct = ((high_price - low_price) / low_price) * 100.0
 
@@ -359,12 +371,6 @@ def analyze_coin(coin, tf):
     rel_volume = None
     momentum_strength = None
     compression_score = None
-
-    funding_rate = get_binance_funding(symbol)
-    oi_change_pct, open_interest = get_binance_oi_change(symbol, tf)
-
-    long_pct, short_pct = get_long_short(coin, tf)
-    bids_total, asks_total = get_orderbook(coin)
 
     if avg_prev_volume and avg_prev_volume > 0:
         volume_change_pct = ((quote_volume - avg_prev_volume) / avg_prev_volume) * 100.0

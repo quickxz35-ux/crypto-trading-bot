@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 app = FastAPI(title="Crypto Favorites Watchlist")
 
-TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m"]
+TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m", "1m"]
 favorites = []
 
 data_cache = TTLCache(maxsize=5000, ttl=30)
@@ -65,7 +65,9 @@ def tf_to_binance(tf):
 
 
 def tf_to_cryptometer(tf):
+    # Cryptometer does not support 1m long/short, so 1m falls back to 5m
     return {
+        "1m": "5m",
         "5m": "5m",
         "15m": "15m",
         "30m": "30m",
@@ -352,7 +354,6 @@ def analyze_coin(coin, tf):
     avg_prev_range = avg(prev_ranges_pct)
     avg_prev_move = avg(prev_moves_pct)
 
-    # Parallelize independent API calls
     with ThreadPoolExecutor(max_workers=4) as executor:
         funding_future = executor.submit(get_binance_funding, symbol)
         oi_future = executor.submit(get_binance_oi_change, symbol, tf)
@@ -827,7 +828,9 @@ def base_layout(title, body):
             }}
             .tiny {{
                 font-size: 11px;
-                color: #94a3b8;
+                color: #ffffff;
+                font-weight: 600;
+                text-transform: uppercase;
             }}
             .bias {{
                 font-weight: 700;

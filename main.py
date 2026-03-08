@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from cachetools import TTLCache
 from concurrent.futures import ThreadPoolExecutor
@@ -11,23 +12,53 @@ TIMEFRAME_OPTIONS = ["1d", "4h", "1h", "30m", "15m", "5m", "1m"]
 favorites = []
 
 data_cache = TTLCache(maxsize=5000, ttl=30)
+stale_cache = {}
 
 CRYPTOMETER_API_KEY = os.getenv("CRYPTOMETER_API_KEY")
+CRYPTOMETER_TIMEOUT = float(os.getenv("CRYPTOMETER_TIMEOUT", "20"))
+CRYPTOMETER_RETRIES = int(os.getenv("CRYPTOMETER_RETRIES", "2"))
+CRYPTOMETER_BACKOFF = float(os.getenv("CRYPTOMETER_BACKOFF", "0.6"))
+
+SESSION = requests.Session()
 
 
 # -------------------------------------------------
 # HELPERS
 # -------------------------------------------------
 
-def safe_get_json(url, params=None, timeout=10):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-        print("GET FAILED:", url, r.status_code, r.text[:300])
-    except Exception as e:
-        print("GET ERROR:", url, str(e))
+def safe_get_json(url, params=None, timeout=10, retries=0, backoff=0.5):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+
+            # Retry transient upstream states.
+            if r.status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+
+            print("GET FAILED:", url, r.status_code, r.text[:300])
+            return None
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            print("GET ERROR:", url, f"timeout after {retries + 1} attempts: {str(e)}")
+            return None
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            print("GET ERROR:", url, str(e))
+            return None
+
+    if last_error:
+        print("GET ERROR:", url, str(last_error))
     return None
 
 
@@ -201,7 +232,13 @@ def get_long_short(coin, tf):
         "api_key": CRYPTOMETER_API_KEY,
     }
 
-    data = safe_get_json("https://api.cryptometer.io/long-shorts-data/", params=params)
+    data = safe_get_json(
+        "https://api.cryptometer.io/long-shorts-data/",
+        params=params,
+        timeout=CRYPTOMETER_TIMEOUT,
+        retries=CRYPTOMETER_RETRIES,
+        backoff=CRYPTOMETER_BACKOFF,
+    )
 
     long_pct = None
     short_pct = None
@@ -221,6 +258,12 @@ def get_long_short(coin, tf):
                 short_pct = parse_float(inner.get("shorts"), None)
 
     result = (long_pct, short_pct)
+    if result[0] is not None or result[1] is not None:
+        stale_cache[cache_key] = result
+    elif cache_key in stale_cache:
+        # Serve stale snapshot during upstream timeout/rate-limit periods.
+        result = stale_cache[cache_key]
+        print("LONG/SHORT STALE FALLBACK:", coin, tf)
     data_cache[cache_key] = result
     return result
 
@@ -238,7 +281,13 @@ def get_orderbook(coin):
         "api_key": CRYPTOMETER_API_KEY,
     }
 
-    data = safe_get_json("https://api.cryptometer.io/merged-orderbook/", params=params)
+    data = safe_get_json(
+        "https://api.cryptometer.io/merged-orderbook/",
+        params=params,
+        timeout=CRYPTOMETER_TIMEOUT,
+        retries=CRYPTOMETER_RETRIES,
+        backoff=CRYPTOMETER_BACKOFF,
+    )
 
     def sum_book_side(entries):
         if entries is None:
@@ -306,6 +355,12 @@ def get_orderbook(coin):
         bids_total if bids_total not in (None, 0) else None,
         asks_total if asks_total not in (None, 0) else None,
     )
+
+    if result[0] is not None or result[1] is not None:
+        stale_cache[cache_key] = result
+    elif cache_key in stale_cache:
+        result = stale_cache[cache_key]
+        print("ORDERBOOK STALE FALLBACK:", coin)
 
     data_cache[cache_key] = result
     return result

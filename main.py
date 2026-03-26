@@ -45,7 +45,7 @@ def start_trade_stream(symbol):
         try:
             data = json.loads(message)
             qty = parse_float(data.get("q"), 0.0) or 0.0
-            is_sell = bool(data.get("m", False))  # True = seller aggressive
+            is_sell = bool(data.get("m", False))
 
             with trade_flow_lock:
                 if symbol not in trade_flow:
@@ -629,6 +629,7 @@ def analyze_coin(coin, tf):
     return {
         "coin": coin,
         "symbol": symbol,
+        "current_price": round(close_price, 6) if close_price is not None else None,
         "bias": bias,
         "price_change_pct": round(price_change_pct, 2),
         "volume_change_pct": round(volume_change_pct, 2) if volume_change_pct is not None else None,
@@ -795,7 +796,7 @@ def render_coin_row(coin, tf, index):
     <div class="coin-card" id="coin-card-{coin}">
         <div class="coin-header">
             <div>
-                <div class="coin-name">{index}. {row['coin']}</div>
+                <div class="coin-name">{index}. {row['coin']} · ${format_num(row['current_price'], 4)}</div>
                 <div class="coin-sub">{bias_badge(row['bias'])} · Price {price_sub}</div>
             </div>
             <div class="coin-actions">
